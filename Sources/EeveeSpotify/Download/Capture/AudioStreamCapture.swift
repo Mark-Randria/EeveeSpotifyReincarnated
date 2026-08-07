@@ -26,6 +26,7 @@ final class AudioStreamCapture {
     private var _cdnURLsByGID: [String: URL] = [:]
     private var _keyResponseBuffers: [URL: Data] = [:]
     private var _latestStream: AudioStream?
+    private var _didLogArmed = false
 
     /// Last captured "Bearer xxx" token (only a short prefix is ever logged).
     /// Falls back to the module-level `spotifyAccessToken` captured by the
@@ -57,6 +58,11 @@ final class AudioStreamCapture {
     /// Called BEFORE any existing hook logic; never influences the result.
     func observe(_ url: URL, headers: [String: String]?, bodyPrefix: Data?, response: Data?) {
         queue.async {
+            if !self._didLogArmed {
+                self._didLogArmed = true
+                DownloadLogger.shared.log("observer armed (first observed request: \(url.host ?? "?")\(url.path))")
+            }
+
             self.captureBearerToken(headers: headers)
 
             guard url.isAudioStreamURL || url.isAudioKeyExchangeURL || url.isSpotifyAPIURL else {
