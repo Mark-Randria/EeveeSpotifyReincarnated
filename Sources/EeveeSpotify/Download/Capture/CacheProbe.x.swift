@@ -105,31 +105,31 @@ class SPTPersistentCacheProbeHook: ClassHook<NSObject> {
     // MARK: store
 
     func storeData(_ data: AnyObject, forKey key: AnyObject, ttl: UInt64, locked: Bool, withCallback callback: AnyObject, onQueue queue: AnyObject) {
-        logStore(data: data, key: key, ttl: ttl, locked: locked)
+        Self.logStore(data: data, key: key, ttl: ttl, locked: locked)
         orig.storeData(data, forKey: key, ttl: ttl, locked: locked, withCallback: callback, onQueue: queue)
     }
 
     func storeData(_ data: AnyObject, forKey key: AnyObject, locked: Bool, withCallback callback: AnyObject, onQueue queue: AnyObject) {
         // Convenience variant without a TTL: ttl=0 means "use the global
         // default" in SPTPersistentCache, so it is reported as ttl=0.
-        logStore(data: data, key: key, ttl: 0, locked: locked)
+        Self.logStore(data: data, key: key, ttl: 0, locked: locked)
         orig.storeData(data, forKey: key, locked: locked, withCallback: callback, onQueue: queue)
     }
 
     // MARK: load / lock / unlock
 
     func loadDataForKey(_ key: AnyObject, withCallback callback: AnyObject, onQueue queue: AnyObject) {
-        logAccess(key: key, action: "load")
+        Self.logAccess(key: key, action: "load")
         orig.loadDataForKey(key, withCallback: callback, onQueue: queue)
     }
 
     func lockDataForKeys(_ keys: AnyObject, callback: AnyObject, onQueue queue: AnyObject) {
-        logAccess(key: keys, action: "lock")
+        Self.logAccess(key: keys, action: "lock")
         orig.lockDataForKeys(keys, callback: callback, onQueue: queue)
     }
 
     func unlockDataForKeys(_ keys: AnyObject, callback: AnyObject, onQueue queue: AnyObject) {
-        logAccess(key: keys, action: "unlock")
+        Self.logAccess(key: keys, action: "unlock")
         orig.unlockDataForKeys(keys, callback: callback, onQueue: queue)
     }
 
@@ -140,21 +140,21 @@ class SPTPersistentCacheProbeHook: ClassHook<NSObject> {
         // pinned-track TTL extension will later need to re-assert itself.
         let usedBytes = orig.totalUsedSizeInBytes()
         let lockedBytes = orig.lockedItemsSizeInBytes()
-        if throttle.shouldLog(key: "prune", method: "prune") {
+        if Self.throttle.shouldLog(key: "prune", method: "prune") {
             DownloadLogger.shared.log("[PROBE][cache] prune usedBytes=\(usedBytes) lockedBytes=\(lockedBytes)")
         }
         orig.pruneWithCallback(callback)
     }
 
     func scheduleGarbageCollector() {
-        if throttle.shouldLog(key: "scheduleGarbageCollector", method: "scheduleGarbageCollector") {
+        if Self.throttle.shouldLog(key: "scheduleGarbageCollector", method: "scheduleGarbageCollector") {
             DownloadLogger.shared.log("[PROBE][cache] scheduleGarbageCollector")
         }
         orig.scheduleGarbageCollector()
     }
 
     func unscheduleGarbageCollector() {
-        if throttle.shouldLog(key: "unscheduleGarbageCollector", method: "unscheduleGarbageCollector") {
+        if Self.throttle.shouldLog(key: "unscheduleGarbageCollector", method: "unscheduleGarbageCollector") {
             DownloadLogger.shared.log("[PROBE][cache] unscheduleGarbageCollector")
         }
         orig.unscheduleGarbageCollector()
