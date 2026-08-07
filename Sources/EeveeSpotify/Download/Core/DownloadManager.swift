@@ -82,20 +82,28 @@ final class DownloadManager {
         setState(.downloading(0))
 
         do {
-            guard AudioStreamCapture.shared.bearerToken != nil else {
-                setState(.failed("No stream captured yet — play the track first"))
+            let hasToken = AudioStreamCapture.shared.bearerToken != nil
+            DownloadLogger.shared.log("download attempt: session token=\(hasToken ? "captured" : "MISSING")")
+
+            guard hasToken else {
+                setState(.failed("No session token captured yet — open Spotify and play a track first"))
                 return
             }
 
             let track = statefulPlayer?.currentTrack()
                 ?? nowPlayingScrollViewController?.loadedTrack
             guard let track = track else {
-                setState(.failed("No stream captured yet — play the track first"))
+                setState(.failed("No track is playing"))
                 return
             }
 
+            DownloadLogger.shared.log("download attempt: track=\(track.trackIdentifier)")
+
             guard let stream = resolveStreamInfo(forTrackIdentifier: track.trackIdentifier) else {
-                setState(.failed("No stream captured yet — play the track first"))
+                DownloadLogger.shared.log(
+                    "download attempt: no stream info for \(track.trackIdentifier), latest=\(AudioStreamCapture.shared.latestStream?.trackGID ?? "nil")"
+                )
+                setState(.failed("No audio stream captured for this track yet — play it first"))
                 return
             }
 

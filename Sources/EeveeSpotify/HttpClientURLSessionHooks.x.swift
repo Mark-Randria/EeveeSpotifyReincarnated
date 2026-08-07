@@ -30,6 +30,11 @@ class HttpClientURLSessionHook: ClassHook<NSObject>, SpotifySessionDelegate {
             return
         }
 
+        // [EeveeDownload spike] Pure observation — marker for completed audio key exchanges.
+        if error == nil, url.isAudioKeyExchangeURL {
+            DownloadLogger.shared.log("audio key exchange completed: \(url.absoluteString)")
+        }
+
         if CasitaResponseProbe.shouldProbe(url) {
             CasitaResponseProbe.flush(task, url: url)
         }
@@ -146,6 +151,23 @@ class HttpClientURLSessionHook: ClassHook<NSObject>, SpotifySessionDelegate {
         didReceiveData data: Data
     ) {
         guard let url = task.currentRequest?.url else { return }
+
+        // [EeveeDownload spike] Pure observation — never alters control flow.
+        AudioStreamCapture.shared.observe(
+            url,
+            headers: task.currentRequest?.allHTTPHeaderFields,
+            bodyPrefix: nil,
+            response: data
+        )
+
+        if let statusCode = (task.response as? HTTPURLResponse)?.statusCode {
+            AudioStreamCapture.shared.noteStatus(statusCode, for: url)
+        }
+
+        if url.isAudioKeyExchangeURL || url.isAudioStreamURL {
+            AudioStreamCapture.shared.observeAudioResponse(url, data: data)
+        }
+
         if SpotifyResponsePatcher.shouldBlock(url) { return }
         if CasitaResponseProbe.shouldProbe(url) {
             CasitaResponseProbe.append(data, for: task)

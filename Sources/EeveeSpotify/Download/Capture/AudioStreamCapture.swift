@@ -28,8 +28,20 @@ final class AudioStreamCapture {
     private var _latestStream: AudioStream?
 
     /// Last captured "Bearer xxx" token (only a short prefix is ever logged).
+    /// Falls back to the module-level `spotifyAccessToken` captured by the
+    /// SPTDataLoaderService / HttpClientURLSession hooks (which look up the
+    /// header case-insensitively), so the token is available even when our own
+    /// header capture misses it.
     var bearerToken: String? {
-        queue.sync { _bearerToken }
+        queue.sync {
+            if let token = _bearerToken, !token.isEmpty {
+                return token
+            }
+            if let token = spotifyAccessToken, !token.isEmpty {
+                return token
+            }
+            return nil
+        }
     }
 
     /// Last fully captured stream (key + url), for fallback use by other lanes.
@@ -140,7 +152,10 @@ final class AudioStreamCapture {
     // MARK: - Internals
 
     private func captureBearerToken(headers: [String: String]?) {
-        guard let authorization = headers?["Authorization"], authorization.hasPrefix("Bearer") else {
+        guard
+            let authorization = headers?["Authorization"] ?? headers?["authorization"],
+            authorization.hasPrefix("Bearer")
+        else {
             return
         }
 
