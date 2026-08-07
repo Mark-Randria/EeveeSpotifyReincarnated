@@ -7,6 +7,10 @@ import Foundation
 ///
 /// Every line is also mirrored to NSLog so the macOS Console.app route keeps
 /// working. Thread-safe: all writes go through a dedicated serial queue.
+///
+/// The FileHandle is opened lazily ONCE and reused for the whole app lifetime —
+/// the previous per-line open/write/close churn caused a logging-storm crash
+/// (thousands of FileHandle opens per second). The handle is never closed.
 final class DownloadLogger {
     static let shared = DownloadLogger()
 
@@ -14,6 +18,9 @@ final class DownloadLogger {
 
     private let queue = DispatchQueue(label: "eevee.download-logger.queue")
     private let logURL: URL
+
+    // Only ever touched on `queue`.
+    private var fileHandle: FileHandle?
 
     private init() {
         let documents = FileManager.default.urls(
@@ -58,18 +65,23 @@ final class DownloadLogger {
             )
         }
 
-        guard let handle = try? FileHandle(forWritingTo: logURL) else {
-            return
+        // Lazily open the handle once; reuse it for every subsequent line.
+        let handle: FileHandle
+        if let existing = fileHandle {
+            handle = existing
+        } else {
+            guard let created = try? FileHandle(forWritingTo: logURL) else {
+                return
+            }
+            fileHandle = created
+            handle = created
         }
 
-        defer {
-            try? handle.close()
-        }
-
-        let size = (try? handle.seekToEnd()) ?? 0
-
-        if size > DownloadLogger.maxLogSize {
+        // Keep the file bounded: once it exceeds maxLogSize, truncate it in
+        // place and rewind to the start of the (now empty) file before writing.
+        if let size = try? handle.seekToEnd(), size > DownloadLogger.maxLogSize {
             handle.truncateFile(atOffset: 0)
+            handle.seek(toFileOffset: 0)
         }
 
         let stamp = ISO8601DateFormatter().string(from: Date())
