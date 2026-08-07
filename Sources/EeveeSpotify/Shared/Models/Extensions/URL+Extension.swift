@@ -154,4 +154,39 @@ extension URL {
         self.path.contains("product-state") ||
         (self.path.contains("license") && self.path.contains("check"))
     }
+
+    // [EeveeDownload spike] Traffic-observation matchers (broad on purpose)
+
+    var isAudioStreamURL: Bool {
+        let host = self.host ?? ""
+        let path = self.path
+        let ext = self.pathExtension.lowercased()
+
+        if host.contains("scdn") { return true }
+        if host.hasPrefix("audio-") { return true }
+        if host.hasSuffix(".audio.spotify.com") { return true }
+        if path.contains("/audio/") { return true }
+        if ["mp4", "aac", "ogg", "mp3"].contains(ext),
+           host.contains("spotify") || host.contains("akamaized") || host.contains("cloudfront") {
+            return true
+        }
+        return false
+    }
+
+    var isAudioKeyExchangeURL: Bool {
+        let path = self.path
+        return path.contains("track-urn")
+            || path.contains("audio-key")
+            || path.contains("key-exchange")
+            || path.contains("crypt")
+            || path.contains("widevine")
+    }
+
+    var isSpotifyAPIURL: Bool {
+        let host = self.host ?? ""
+        return host == "api.spotify.com"
+            || host == "spclient.wg.spotify.com"
+            || host == "gew1-spclient.spotify.com"
+            || host.hasSuffix("spclient.wg.spotify.com")
+    }
 }
