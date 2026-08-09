@@ -1,5 +1,6 @@
 import SwiftUI
 import Combine
+import MediaPlayer
 
 class EeveeCachingSettingsViewModel: ObservableObject {
     @Published private(set) var pinnedTracks: [String] = []
@@ -12,10 +13,58 @@ class EeveeCachingSettingsViewModel: ObservableObject {
     /// Normalized track id (spotify:track:XXXX -> XXXX) or nil when nothing is
     /// playing / the id cannot be derived. PinnedTracksStore uses the same
     /// normalization internally, so comparisons are consistent.
+    ///
+    /// On 9.1.x the player globals are never set, so we fall back to the id fed
+    /// to CachePinState from the lyrics URL-delegate (getLyricsDataForCurrentTrack),
+    /// which fires reliably during playback.
     var currentTrackId: String? {
-        guard let identifier = currentTrack?.trackIdentifier else { return nil }
-        let normalized = PinnedTracksStore.normalize(identifier)
-        return normalized.isEmpty ? nil : normalized
+        if let identifier = currentTrack?.trackIdentifier {
+            let normalized = PinnedTracksStore.normalize(identifier)
+            if !normalized.isEmpty { return normalized }
+        }
+        return CachePinState.shared.currentTrackID()
+    }
+
+    var currentTrackTitle: String? {
+        if let track = currentTrack { return track.trackTitle() }
+        return nowPlayingTitle()
+    }
+
+    var currentTrackArtist: String? {
+        if let track = currentTrack {
+            return EeveeSpotify.hookTarget == .lastAvailableiOS14 ? track.artistTitle() : track.artistName()
+        }
+        return nowPlayingArtist()
+    }
+
+    var hasCurrentTrack: Bool {
+        currentTrackId != nil
+    }
+
+    // MPNowPlayingInfoCenter must be read on the main thread; mirror the
+    // Thread.isMainThread / DispatchQueue.main.sync pattern from CustomLyrics.
+    private func nowPlayingTitle() -> String? {
+        var title: String?
+        if Thread.isMainThread {
+            title = MPNowPlayingInfoCenter.default().nowPlayingInfo?[MPMediaItemPropertyTitle] as? String
+        } else {
+            DispatchQueue.main.sync {
+                title = MPNowPlayingInfoCenter.default().nowPlayingInfo?[MPMediaItemPropertyTitle] as? String
+            }
+        }
+        return title
+    }
+
+    private func nowPlayingArtist() -> String? {
+        var artist: String?
+        if Thread.isMainThread {
+            artist = MPNowPlayingInfoCenter.default().nowPlayingInfo?[MPMediaItemPropertyArtist] as? String
+        } else {
+            DispatchQueue.main.sync {
+                artist = MPNowPlayingInfoCenter.default().nowPlayingInfo?[MPMediaItemPropertyArtist] as? String
+            }
+        }
+        return artist
     }
     
     var isCurrentTrackPinned: Bool {

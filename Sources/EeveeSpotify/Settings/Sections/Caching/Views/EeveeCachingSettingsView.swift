@@ -26,7 +26,7 @@ struct EeveeCachingSettingsView: View {
     
     @ViewBuilder private func currentTrackSection() -> some View {
         Section(header: Text("Current Track")) {
-            if let track = viewModel.currentTrack {
+            if let title = viewModel.currentTrackTitle {
                 HStack(spacing: 15) {
                     Image(systemName: "music.note")
                         .font(.headline)
@@ -36,15 +36,33 @@ struct EeveeCachingSettingsView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                     
                     VStack(alignment: .leading, spacing: 3) {
-                        Text(track.trackTitle())
+                        Text(title)
                             .font(.headline)
                             .lineLimit(1)
                         
-                        Text(EeveeSpotify.hookTarget == .lastAvailableiOS14 ? track.artistTitle() : track.artistName())
+                        Text(viewModel.currentTrackArtist ?? "")
                             .font(.subheadline)
                             .foregroundColor(.secondary)
                             .lineLimit(1)
                     }
+                    
+                    Spacer()
+                }
+                .padding(.vertical, 5)
+            }
+            else if let id = viewModel.currentTrackId {
+                HStack(spacing: 15) {
+                    Image(systemName: "music.note")
+                        .font(.headline)
+                        .foregroundColor(EeveeSettingsView.spotifyAccentColor)
+                        .frame(width: 34, height: 34)
+                        .background(Color.white.opacity(0.08))
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    
+                    Text(id)
+                        .font(.system(.footnote, design: .monospaced))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                     
                     Spacer()
                 }
@@ -69,7 +87,7 @@ struct EeveeCachingSettingsView: View {
     
     @ViewBuilder private func pinActionSection() -> some View {
         Section {
-            if viewModel.currentTrack != nil {
+            if viewModel.hasCurrentTrack {
                 Toggle(
                     isOn: Binding(
                         get: { viewModel.isCurrentTrackPinned },

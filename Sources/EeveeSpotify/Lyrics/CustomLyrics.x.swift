@@ -440,6 +440,8 @@ func getLyricsDataForCurrentTrack(_ originalPath: String, originalLyrics: Lyrics
         throw LyricsError.noCurrentTrack
     }
 
+    CachePinState.shared.noteCurrentTrack(trackIdentifier)
+
     if capturedTrackId != trackIdentifier {
         capturedTrackTitle = nil
         capturedArtistName = nil

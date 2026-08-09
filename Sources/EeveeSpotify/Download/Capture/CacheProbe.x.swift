@@ -104,11 +104,13 @@ private final class CacheProbeStats {
 
 /// Thread-safe state backing the pin enforcer.
 ///
-/// - `currentTrackId` is fed from the MAIN thread (SPTPlayerTrackHook.URI()),
-///   never from the cache callback queue — the player objects are
-///   main-thread-bound, and reading them from a background queue is exactly
-///   the type confusion that caused the `__NSMallocBlock__ _fastCStringContents:`
-///   crash (bridged block treated as a string).
+/// - `currentTrackId` is fed from the MAIN thread (SPTPlayerTrackHook.URI())
+///   and from the lyrics URL-delegate queues (getLyricsDataForCurrentTrack).
+///   noteCurrentTrack only stores a normalized string under the lock, so it is
+///   safe from any thread — unlike reading the player objects from a background
+///   queue, which is exactly the type confusion that caused the
+///   `__NSMallocBlock__ _fastCStringContents:` crash (bridged block treated as
+///   a string).
 /// - `learnedKeysByTrack` records keys observed while a PINNED track was
 ///   current, so records stored under file-id / GID shapes (rather than the
 ///   base62 id) are still recognized and pinned.
@@ -128,12 +130,19 @@ final class CachePinState {
 
     private init() {}
 
-    // MARK: Current track (main thread only)
+    // MARK: Current track (any thread; stores a normalized string under lock)
 
     func noteCurrentTrack(_ trackId: String?) {
         lock.lock()
         defer { lock.unlock() }
         currentTrackId = trackId.map { PinnedTracksStore.normalize($0) }
+    }
+
+    /// Thread-safe read of the current track id for UI / pin logic.
+    func currentTrackID() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return currentTrackId
     }
 
     // MARK: Key learning (cache callback queue)
