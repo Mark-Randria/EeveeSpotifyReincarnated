@@ -29,17 +29,15 @@ func writeDebugLog(_ message: String) {
     if let existing = debugLogHandle {
         handle = existing
     } else {
-        guard let created = FileHandle(forWritingAtPath: logPath) else {
-            // File does not exist yet — create it, then open once.
-            guard FileManager.default.createFile(atPath: logPath, contents: nil, attributes: nil) else {
-                return
-            }
-            guard let opened = FileHandle(forWritingAtPath: logPath) else {
-                return
-            }
-            debugLogHandle = opened
-            handle = opened
+        // File does not exist yet — create it, then open once.
+        if !FileManager.default.fileExists(atPath: logPath) {
+            FileManager.default.createFile(atPath: logPath, contents: nil, attributes: nil)
         }
+        guard let opened = FileHandle(forWritingAtPath: logPath) else {
+            return
+        }
+        debugLogHandle = opened
+        handle = opened
     }
 
     // Keep the file bounded: truncate in place and rewind once it exceeds the cap.
