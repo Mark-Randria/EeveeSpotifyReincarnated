@@ -118,6 +118,19 @@ struct EeveeSettingsView: View {
 
             Button {
                 pushSettingsController(
+                    with: EeveeCachingSettingsView(),
+                    title: "Caching"
+                )
+            } label: {
+                NavigationSectionView(
+                    color: .green,
+                    title: "Caching",
+                    imageSystemName: "arrow.down.circle.fill"
+                )
+            }
+
+            Button {
+                pushSettingsController(
                     with: EeveeAppIconPickerView(),
                     title: "appIcon".localized
                 )
