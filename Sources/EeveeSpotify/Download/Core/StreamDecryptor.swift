@@ -10,10 +10,11 @@ import CommonCrypto
 /// - The file is processed in 4096-byte chunks (256 AES blocks per chunk), so
 ///   chunk `i` uses counter = baseIV + 0x100 * i (i.e. +256 per chunk).
 ///
-/// This implementation decrypts per 4096-byte chunk with the chunk counter
-/// computed explicitly (`counterIV(chunkIndex:)`) so the math is directly
-/// verifiable. Because CTR is stateless, this is byte-for-byte identical to a
-/// single continuous CTR stream over the whole file.
+/// Decryption always goes through `StreamCTREncryptor` — ONE cryptor per stream
+/// whose internal CTR counter advances across every `CCCryptorUpdate`. That is
+/// byte-for-byte identical to the old per-chunk cryptor + `counterIV()` math but
+/// avoids creating/releasing a cryptor for every 4KB chunk (~1280 cycles per
+/// 5MB song).
 enum StreamDecryptor {
     enum DecryptError: LocalizedError {
         case invalidKeyLength(Int)
@@ -47,18 +48,32 @@ enum StreamDecryptor {
     /// Librespot chunk size: 4096 bytes == 256 AES blocks == 0x100 counter ticks.
     static let chunkSize = 4096
 
+    /// Counter for chunk `i`: baseIV (big-endian 128-bit integer) + 0x100 * i.
+    ///
+    /// Big-endian means bytes[0] is the most significant byte, so the addend is
+    /// propagated from the least significant byte (index 15) upward.
+    static func counterIV(chunkIndex: Int) -> Data {
+        var bytes = baseIV
+        var addend = chunkIndex << 8 // 0x100 * chunkIndex
+        var index = bytes.count - 1
+        while addend > 0 && index >= 0 {
+            let sum = Int(bytes[index]) + (addend & 0xFF)
+            bytes[index] = UInt8(sum & 0xFF)
+            addend = (addend >> 8) + (sum >> 8)
+            index -= 1
+        }
+        return Data(bytes)
+    }
+
     /// Streams `input` through AES-128-CTR into `output`. Never loads the whole
-    /// file into memory: input is read and decrypted in 4096-byte chunks.
+    /// file into memory: input is read and decrypted in 4096-byte chunks through
+    /// a single reusable cryptor (created once for the whole file).
     static func decryptStream(
         input: URL,
         output: URL,
         key: Data,
         progress: ((Double) -> Void)?
     ) throws {
-        guard key.count == 16 else {
-            throw DecryptError.invalidKeyLength(key.count)
-        }
-
         // ---- Input ----
         let inputHandle: FileHandle
         do {
@@ -89,7 +104,7 @@ enum StreamDecryptor {
         defer { try? outputHandle.close() }
 
         // ---- Decrypt loop ----
-        var chunkIndex = 0
+        let cryptor = try StreamCTREncryptor(key: key)
         var processed: Int64 = 0
 
         while true {
@@ -102,8 +117,7 @@ enum StreamDecryptor {
             }
             guard !chunk.isEmpty else { break }
 
-            let chunkIV = counterIV(chunkIndex: chunkIndex)
-            let decrypted = try decryptChunk(chunk, key: key, iv: chunkIV)
+            let decrypted = try cryptor.decrypt(chunk)
 
             do {
                 try outputHandle.write(contentsOf: decrypted)
@@ -116,30 +130,47 @@ enum StreamDecryptor {
             if let progress = progress, totalBytes > 0 {
                 progress(min(1.0, Double(processed) / Double(totalBytes)))
             }
-            chunkIndex += 1
         }
-    }
 
-    /// Counter for chunk `i`: baseIV (big-endian 128-bit integer) + 0x100 * i.
+        // Flush (no-op for CTR/no-padding) and release the cryptor.
+        try cryptor.finalize()
+    }
+}
+
+/// Reusable AES-128-CTR cryptor with continuous counter state.
+///
+/// CTR mode is a pure keystream generator: the counter advances inside the
+/// cryptor across every `CCCryptorUpdate`, so one cryptor can decrypt a whole
+/// stream in arbitrary chunk sizes without per-chunk IV math or create/release
+/// churn. The old per-chunk pattern created and released a `CCCryptorRef` for
+/// every 4096-byte chunk — about 1280 cryptors per 5MB song.
+///
+/// Not thread-safe: a single instance must only be used from one thread (the
+/// URLSession delegate queue for network paths, or the caller for file paths).
+final class StreamCTREncryptor {
+    /// The active cryptor. Nil once `finalize()` (or deinit) releases it, which
+    /// makes release exactly-once regardless of how many times it is attempted.
+    private var cryptor: CCCryptorRef?
+
+    /// Output buffer allocated once at init and reused for every chunk; grows
+    /// lazily only when a single chunk exceeds the initial size. No per-chunk
+    /// allocation on the hot path.
+    private var outputBuffer: [UInt8]
+
+    /// Creates ONE cryptor seeded with the fixed librespot `baseIV`.
     ///
-    /// Big-endian means bytes[0] is the most significant byte, so the addend is
-    /// propagated from the least significant byte (index 15) upward.
-    static func counterIV(chunkIndex: Int) -> Data {
-        var bytes = baseIV
-        var addend = chunkIndex << 8 // 0x100 * chunkIndex
-        var index = bytes.count - 1
-        while addend > 0 && index >= 0 {
-            let sum = Int(bytes[index]) + (addend & 0xFF)
-            bytes[index] = UInt8(sum & 0xFF)
-            addend = (addend >> 8) + (sum >> 8)
-            index -= 1
+    /// `kCCModeOptionCTR_BE` makes CommonCrypto treat the counter as a big-endian
+    /// integer that increments across updates — the same counter stream the old
+    /// `counterIV(chunkIndex:)` math produced manually.
+    init(key: Data) throws {
+        guard key.count == 16 else {
+            throw StreamDecryptor.DecryptError.invalidKeyLength(key.count)
         }
-        return Data(bytes)
-    }
 
-    private static func decryptChunk(_ chunk: Data, key: Data, iv: Data) throws -> Data {
-        var cryptor: CCCryptorRef?
+        outputBuffer = [UInt8](repeating: 0, count: StreamDecryptor.chunkSize)
 
+        var created: CCCryptorRef?
+        let iv = StreamDecryptor.baseIV
         let status: CCCryptorStatus = key.withUnsafeBytes { keyBuffer in
             iv.withUnsafeBytes { ivBuffer in
                 guard let keyBase = keyBuffer.baseAddress, let ivBase = ivBuffer.baseAddress else {
@@ -157,27 +188,35 @@ enum StreamDecryptor {
                     0,
                     0,
                     CCModeOptions(kCCModeOptionCTR_BE),
-                    &cryptor
+                    &created
                 )
             }
         }
 
-        guard status == kCCSuccess, let cryptor = cryptor else {
-            throw DecryptError.cryptoFailure(Int32(status))
+        guard status == kCCSuccess, let created = created else {
+            throw StreamDecryptor.DecryptError.cryptoFailure(Int32(status))
         }
-        defer { CCCryptorRelease(cryptor) }
+        cryptor = created
+    }
 
-        var output = [UInt8](repeating: 0, count: chunk.count)
+    /// Decrypts one chunk, reusing the internal output buffer. Returns a copy of
+    /// exactly the decrypted bytes (one unavoidable `Data` copy per chunk).
+    func decrypt(_ chunk: Data) throws -> Data {
+        guard let cryptor = cryptor else {
+            throw StreamDecryptor.DecryptError.cryptoFailure(kCCUnimplemented)
+        }
+        guard !chunk.isEmpty else { return Data() }
+
+        // Grow the reused buffer only when a single chunk exceeds the init size.
+        if chunk.count > outputBuffer.count {
+            outputBuffer = [UInt8](repeating: 0, count: chunk.count)
+        }
+
+        let capacity = outputBuffer.count
         var moved = 0
-
-        // Copy to a local so the in-place decrypt runs on the copy and the
-        // buffer access doesn't overlap the `output` variable (Swift
-        // exclusive-access rule). Write back once after decrypting.
-        let outputCount = output.count
-        var decrypted = output
-        let updateStatus: CCCryptorStatus = chunk.withUnsafeBytes { inputBuffer in
-            decrypted.withUnsafeMutableBytes { outputBuffer in
-                guard let inputBase = inputBuffer.baseAddress, let outputBase = outputBuffer.baseAddress else {
+        let status: CCCryptorStatus = chunk.withUnsafeBytes { inputBuffer in
+            outputBuffer.withUnsafeMutableBytes { outputBufferPtr in
+                guard let inputBase = inputBuffer.baseAddress, let outputBase = outputBufferPtr.baseAddress else {
                     return CCCryptorStatus(kCCMemoryFailure)
                 }
                 return CCCryptorUpdate(
@@ -185,17 +224,50 @@ enum StreamDecryptor {
                     inputBase,
                     chunk.count,
                     outputBase,
-                    outputCount,
+                    capacity,
                     &moved
                 )
             }
         }
-        output = decrypted
 
-        guard updateStatus == kCCSuccess, moved == chunk.count else {
-            throw DecryptError.cryptoFailure(Int32(updateStatus))
+        guard status == kCCSuccess else {
+            throw StreamDecryptor.DecryptError.cryptoFailure(Int32(status))
         }
 
-        return Data(output)
+        return Data(outputBuffer[0..<moved])
+    }
+
+    /// Flushes the cryptor and releases it. For CTR with no padding this yields
+    /// no output, but `CCCryptorFinal` must still be called. Idempotent: the
+    /// underlying cryptor is released at most once.
+    func finalize() throws {
+        guard let cryptor = cryptor else { return }
+
+        let capacity = outputBuffer.count
+        var moved = 0
+        let status: CCCryptorStatus = outputBuffer.withUnsafeMutableBytes { outputBufferPtr in
+            guard let outputBase = outputBufferPtr.baseAddress else {
+                return CCCryptorStatus(kCCMemoryFailure)
+            }
+            return CCCryptorFinal(cryptor, outputBase, capacity, &moved)
+        }
+
+        releaseCryptor()
+
+        guard status == kCCSuccess else {
+            throw StreamDecryptor.DecryptError.cryptoFailure(Int32(status))
+        }
+    }
+
+    deinit {
+        // Safety net: release the cryptor even when `finalize()` was never
+        // called (e.g. a download failed mid-stream).
+        releaseCryptor()
+    }
+
+    private func releaseCryptor() {
+        guard let cryptor = cryptor else { return }
+        CCCryptorRelease(cryptor)
+        self.cryptor = nil
     }
 }

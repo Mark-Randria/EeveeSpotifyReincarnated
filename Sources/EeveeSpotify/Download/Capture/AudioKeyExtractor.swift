@@ -11,23 +11,26 @@ import Foundation
 /// NOTE: This is a heuristic. It may return a false positive or nil, and it is
 /// strictly best-effort. It must never crash and never throw — every failure
 /// path returns nil.
+///
+/// CRASH CONTEXT: the first version copied the whole chunk into `[UInt8](data)`
+/// on every call. Key-exchange chunks arrive on the hot per-chunk path, so the
+/// scan now reads `data` directly via its Int subscript (no full copy).
 enum AudioKeyExtractor {
     static func extractKey(from data: Data) -> Data? {
         guard data.count >= 16 else {
             return nil
         }
 
-        let bytes = [UInt8](data)
         var offset = 0
 
-        while offset < bytes.count {
+        while offset < data.count {
             // Try to decode a varint length starting at `offset`.
             var value: UInt64 = 0
             var shift: UInt64 = 0
             var cursor = offset
 
-            while cursor < bytes.count && shift < 64 {
-                let byte = bytes[cursor]
+            while cursor < data.count && shift < 64 {
+                let byte = data[cursor]
                 value |= UInt64(byte & 0x7F) << shift
                 cursor += 1
 
@@ -38,8 +41,8 @@ enum AudioKeyExtractor {
             }
 
             // Look for a length == 16 followed by 16 all-non-zero bytes.
-            if value == 16 && cursor + 16 <= bytes.count {
-                let candidate = Data(bytes[cursor ..< cursor + 16])
+            if value == 16 && cursor + 16 <= data.count {
+                let candidate = data.subdata(in: cursor ..< cursor + 16)
                 if !candidate.contains(0) {
                     return candidate
                 }

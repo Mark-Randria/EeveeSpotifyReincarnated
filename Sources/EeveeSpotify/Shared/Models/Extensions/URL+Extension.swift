@@ -159,13 +159,16 @@ extension URL {
 
     var isAudioStreamURL: Bool {
         let host = self.host ?? ""
-        let path = self.path
         let ext = self.pathExtension.lowercased()
 
-        if host.contains("scdn") { return true }
+        // [EeveeDownload spike] Deliberately narrow: the previous matchers were
+        // too broad (`host.contains("scdn")` and any path containing "/audio/")
+        // and pulled in prefetch / album-preload traffic. These are tuned from
+        // the on-device probe logs in eevee.log; broaden only when a probe shows
+        // a real stream URL being missed.
+        if host == "scdn.spotify.com" || host.hasSuffix(".scdn.spotify.com") { return true }
         if host.hasPrefix("audio-") { return true }
         if host.hasSuffix(".audio.spotify.com") { return true }
-        if path.contains("/audio/") { return true }
         if ["mp4", "aac", "ogg", "mp3"].contains(ext),
            host.contains("spotify") || host.contains("akamaized") || host.contains("cloudfront") {
             return true

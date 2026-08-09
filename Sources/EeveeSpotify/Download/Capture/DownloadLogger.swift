@@ -11,16 +11,29 @@ import Foundation
 /// The FileHandle is opened lazily ONCE and reused for the whole app lifetime —
 /// the previous per-line open/write/close churn caused a logging-storm crash
 /// (thousands of FileHandle opens per second). The handle is never closed.
+///
+/// CRASH CONTEXT: the first spike version also ran a `fileExists` check, an
+/// `ISO8601DateFormatter` allocation, and a `seekToEnd()` size probe on every
+/// line. All three are now done once or tracked in memory instead of touching
+/// the filesystem per line.
 final class DownloadLogger {
     static let shared = DownloadLogger()
 
-    private static let maxLogSize: UInt64 = 512 * 1024
+    private static let maxLogSize: Int64 = 512 * 1024
 
     private let queue = DispatchQueue(label: "eevee.download-logger.queue")
     private let logURL: URL
 
     // Only ever touched on `queue`.
     private var fileHandle: FileHandle?
+    /// True once the log file has been created/verified; avoids the per-line
+    /// `fileExists` syscall.
+    private var fileCreated = false
+    /// Bytes written since the last truncation; avoids a per-line `seekToEnd()`.
+    private var writtenBytes: Int64 = 0
+
+    /// Shared formatter — allocating one per line was pure waste.
+    private static let isoFormatter = ISO8601DateFormatter()
 
     private init() {
         let documents = FileManager.default.urls(
@@ -56,13 +69,16 @@ final class DownloadLogger {
     private func append(_ line: String) {
         NSLog(line)
 
-        let attributes: [FileAttributeKey: Any] = [.creationDate: Date()]
-        if !FileManager.default.fileExists(atPath: logURL.path) {
-            FileManager.default.createFile(
-                atPath: logURL.path,
-                contents: nil,
-                attributes: attributes
-            )
+        if !fileCreated {
+            fileCreated = true
+            if !FileManager.default.fileExists(atPath: logURL.path) {
+                let attributes: [FileAttributeKey: Any] = [.creationDate: Date()]
+                FileManager.default.createFile(
+                    atPath: logURL.path,
+                    contents: nil,
+                    attributes: attributes
+                )
+            }
         }
 
         // Lazily open the handle once; reuse it for every subsequent line.
@@ -77,14 +93,18 @@ final class DownloadLogger {
             handle = created
         }
 
-        // Keep the file bounded: once it exceeds maxLogSize, truncate it in
-        // place and rewind to the start of the (now empty) file before writing.
-        if let size = try? handle.seekToEnd(), size > DownloadLogger.maxLogSize {
+        // Keep the file bounded: track bytes written in memory instead of asking
+        // the FS for the size every line. Once the log exceeds maxLogSize, truncate
+        // it in place and rewind to the start of the (now empty) file before writing.
+        if writtenBytes > DownloadLogger.maxLogSize {
             handle.truncateFile(atOffset: 0)
             handle.seek(toFileOffset: 0)
+            writtenBytes = 0
         }
 
-        let stamp = ISO8601DateFormatter().string(from: Date())
-        handle.write(Data("\(stamp) \(line)\n".utf8))
+        let stamp = DownloadLogger.isoFormatter.string(from: Date())
+        let data = Data("\(stamp) \(line)\n".utf8)
+        writtenBytes += Int64(data.count)
+        handle.write(data)
     }
 }

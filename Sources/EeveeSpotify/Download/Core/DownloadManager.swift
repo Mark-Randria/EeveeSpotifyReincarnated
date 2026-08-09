@@ -4,9 +4,11 @@ import Foundation
 /// captured stream/key from `AudioStreamCapture`, downloads + decrypts through
 /// `SpotifyCDNClient`, and persists the result.
 ///
-/// ALL work runs on a serial dispatch queue so it is concurrency-safe even
-/// though this dylib lives inside the Spotify app. Never touches the main thread
-/// except for posting the state-change notification.
+/// State is guarded by `lock` and downloads run as Swift concurrency tasks
+/// (single-flight via the state check), so this is concurrency-safe even though
+/// the dylib lives inside the Spotify app. The main thread is only touched for
+/// the state-change notification and for resolving the current track (which is
+/// main-thread-bound — see `resolveCurrentTrack()`).
 final class DownloadManager {
     /// Nested so consumers reference it as `DownloadManager.DownloadState`.
     enum DownloadState: Equatable {
@@ -51,7 +53,12 @@ final class DownloadManager {
 
     func downloadCurrentTrack() {
         queue.async { [weak self] in
-            self?.performDownload()
+            guard let self = self else { return }
+            // Bridge the serial queue into Swift concurrency WITHOUT a semaphore:
+            // a `Task` started from a non-actor (dispatch-queue) context runs on
+            // the global executor, and the single-flight state check below keeps
+            // concurrent calls from overlapping.
+            Task { await self.performDownload() }
         }
     }
 
@@ -71,13 +78,19 @@ final class DownloadManager {
 
     // MARK: - Download flow
 
-    private func performDownload() {
+    private func performDownload() async {
         lock.lock()
         if case .downloading = _state {
             lock.unlock()
             return
         }
         lock.unlock()
+
+        // Arm the capture gate BEFORE resolving anything: the audio-key exchange
+        // and CDN stream URLs must be captured while the download runs (see
+        // AudioStreamCapture.isCapturing). Disarmed on every exit path.
+        AudioStreamCapture.shared.isCapturing = true
+        defer { AudioStreamCapture.shared.isCapturing = false }
 
         setState(.downloading(0))
 
@@ -90,8 +103,7 @@ final class DownloadManager {
                 return
             }
 
-            let track = statefulPlayer?.currentTrack()
-                ?? nowPlayingScrollViewController?.loadedTrack
+            let track = resolveCurrentTrack()
             guard let track = track else {
                 setState(.failed("No track is playing"))
                 return
@@ -118,13 +130,15 @@ final class DownloadManager {
             )
             let directory = try downloadsDirectory()
 
-            let downloadResult = waitForDownload(
+            let finalURL = try await cdnClient.downloadEncryptedStream(
                 url: stream.url,
                 key: stream.key,
-                directory: directory,
-                fileName: fileName
+                to: directory,
+                fileName: fileName,
+                progress: { [weak self] progress in
+                    self?.setState(.downloading(progress))
+                }
             )
-            let finalURL = try downloadResult.get()
 
             let attributes = try? fileManager.attributesOfItem(atPath: finalURL.path)
             let size = (attributes?[.size] as? NSNumber)?.int64Value ?? 0
@@ -148,38 +162,17 @@ final class DownloadManager {
         }
     }
 
-    /// Bridges the serial queue to the async CDN client via a semaphore so all
-    /// downloads stay serialized on `queue`.
-    private func waitForDownload(
-        url: URL,
-        key: Data,
-        directory: URL,
-        fileName: String
-    ) -> Result<URL, Error> {
-        var result: Result<URL, Error>?
-        let semaphore = DispatchSemaphore(value: 0)
-
-        Task {
-            do {
-                let finalURL = try await cdnClient.downloadEncryptedStream(
-                    url: url,
-                    key: key,
-                    to: directory,
-                    fileName: fileName,
-                    progress: { [weak self] progress in
-                        self?.setState(.downloading(progress))
-                    }
-                )
-                result = .success(finalURL)
-            }
-            catch let error {
-                result = .failure(error)
-            }
-            semaphore.signal()
+    /// `statefulPlayer` / `nowPlayingScrollViewController` are main-thread-bound
+    /// ObjC/UIKit objects; this download queue is a background dispatch queue, so
+    /// hop to the main thread (guarding against being called ON main, e.g. when
+    /// the Task runs on the main actor).
+    private func resolveCurrentTrack() -> SPTPlayerTrack? {
+        if Thread.isMainThread {
+            return statefulPlayer?.currentTrack() ?? nowPlayingScrollViewController?.loadedTrack
         }
-
-        semaphore.wait()
-        return result ?? .failure(DownloadError.internalFailure)
+        return DispatchQueue.main.sync {
+            statefulPlayer?.currentTrack() ?? nowPlayingScrollViewController?.loadedTrack
+        }
     }
 
     // MARK: - Stream info resolution
@@ -342,13 +335,5 @@ final class DownloadManager {
                 object: nil
             )
         }
-    }
-}
-
-private enum DownloadError: LocalizedError {
-    case internalFailure
-
-    var errorDescription: String? {
-        "Download failed"
     }
 }

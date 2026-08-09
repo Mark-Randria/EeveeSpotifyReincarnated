@@ -4,6 +4,16 @@ import UIKit
 import Foundation
 import ObjectiveC.runtime
 
+// Debug log state: the FileHandle is opened lazily ONCE and reused for the whole
+// app lifetime. The previous per-call open/seek/write/close churn (a syscall +
+// kernel-buffer flush per line) contributed to a logging-storm crash — the same
+// anti-pattern DownloadLogger fixed. All state is guarded by a lock because
+// writeDebugLog is called from many threads.
+private let debugLogLock = NSLock()
+private var debugLogHandle: FileHandle?
+private var debugLogBytes: Int64 = 0
+private let debugLogMaxSize: Int64 = 512 * 1024
+
 func writeDebugLog(_ message: String) {
     // Log to system console
     NSLog("[EeveeSpotify] %@", message)
@@ -11,17 +21,38 @@ func writeDebugLog(_ message: String) {
     let logPath = NSTemporaryDirectory() + "eeveespotify_debug.log"
     let timestamp = Date().description
     let logMessage = "[\(timestamp)] \(message)\n"
-    
-    if FileManager.default.fileExists(atPath: logPath) {
-        if let fileHandle = FileHandle(forWritingAtPath: logPath) {
-            fileHandle.seekToEndOfFile()
-            if let data = logMessage.data(using: .utf8) {
-                fileHandle.write(data)
-            }
-            fileHandle.closeFile()
-        }
+
+    debugLogLock.lock()
+    defer { debugLogLock.unlock() }
+
+    let handle: FileHandle
+    if let existing = debugLogHandle {
+        handle = existing
     } else {
-        try? logMessage.write(toFile: logPath, atomically: true, encoding: .utf8)
+        guard let created = FileHandle(forWritingAtPath: logPath) else {
+            // File does not exist yet — create it, then open once.
+            guard FileManager.default.createFile(atPath: logPath, contents: nil, attributes: nil) else {
+                return
+            }
+            guard let opened = FileHandle(forWritingAtPath: logPath) else {
+                return
+            }
+            debugLogHandle = opened
+            handle = opened
+        }
+    }
+
+    // Keep the file bounded: truncate in place and rewind once it exceeds the cap.
+    let lineBytes = Int64(logMessage.utf8.count)
+    if debugLogBytes + lineBytes > debugLogMaxSize {
+        handle.truncateFile(atOffset: 0)
+        handle.seek(toFileOffset: 0)
+        debugLogBytes = 0
+    }
+
+    if let data = logMessage.data(using: .utf8) {
+        handle.write(data)
+        debugLogBytes += Int64(data.count)
     }
 }
 

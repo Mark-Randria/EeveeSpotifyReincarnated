@@ -164,7 +164,9 @@ class HttpClientURLSessionHook: ClassHook<NSObject>, SpotifySessionDelegate {
             AudioStreamCapture.shared.noteStatus(statusCode, for: url)
         }
 
-        if url.isAudioKeyExchangeURL || url.isAudioStreamURL {
+        // Audio stream bodies are encrypted and can never contain a key — only
+        // key-exchange responses are buffered for extraction.
+        if url.isAudioKeyExchangeURL {
             AudioStreamCapture.shared.observeAudioResponse(url, data: data)
         }
 
