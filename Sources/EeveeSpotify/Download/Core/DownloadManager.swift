@@ -76,15 +76,30 @@ final class DownloadManager {
         }
     }
 
+    /// Inserts a finished download at the top of the list (replacing any entry
+    /// with the same relative path). Synchronous helper so the NSLock is never
+    /// touched from an async context (Swift 6 requirement).
+    private func recordDownloadedFile(_ file: DownloadedFile) {
+        lock.lock()
+        defer { lock.unlock() }
+        _downloadedFiles.removeAll { $0.relativePath == file.relativePath }
+        _downloadedFiles.insert(file, at: 0)
+    }
+
     // MARK: - Download flow
 
-    private func performDownload() async {
+    /// Single-flight guard: returns true if the download may proceed. Extracted
+    /// into a synchronous helper because NSLock must not be touched directly
+    /// from an async context (Swift 6 enforces this).
+    private func beginDownloadIfIdle() -> Bool {
         lock.lock()
-        if case .downloading = _state {
-            lock.unlock()
-            return
-        }
-        lock.unlock()
+        defer { lock.unlock() }
+        guard case .downloading = _state else { return true }
+        return false
+    }
+
+    private func performDownload() async {
+        guard beginDownloadIfIdle() else { return }
 
         // Arm the capture gate BEFORE resolving anything: the audio-key exchange
         // and CDN stream URLs must be captured while the download runs (see
@@ -149,10 +164,7 @@ final class DownloadManager {
                 relativePath: finalURL.lastPathComponent
             )
 
-            lock.lock()
-            _downloadedFiles.removeAll { $0.relativePath == downloadedFile.relativePath }
-            _downloadedFiles.insert(downloadedFile, at: 0)
-            lock.unlock()
+            recordDownloadedFile(downloadedFile)
             persist()
 
             setState(.finished(finalURL))

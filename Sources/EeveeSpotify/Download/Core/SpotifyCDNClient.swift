@@ -350,7 +350,8 @@ private final class DownloadProgressDelegate: NSObject, URLSessionDataDelegate {
                 try cryptor.finalize()
             }
             if let fileHandle = fileHandle {
-                try fileHandle.synchronizeFile()
+                // synchronizeFile() is non-throwing (unlike close()).
+                fileHandle.synchronizeFile()
                 try fileHandle.close()
             }
         }

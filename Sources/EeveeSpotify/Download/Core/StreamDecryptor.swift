@@ -203,7 +203,8 @@ final class StreamCTREncryptor {
     /// exactly the decrypted bytes (one unavoidable `Data` copy per chunk).
     func decrypt(_ chunk: Data) throws -> Data {
         guard let cryptor = cryptor else {
-            throw StreamDecryptor.DecryptError.cryptoFailure(kCCUnimplemented)
+            // kCCUnimplemented is an Int constant; cryptoFailure takes Int32.
+            throw StreamDecryptor.DecryptError.cryptoFailure(Int32(kCCUnimplemented))
         }
         guard !chunk.isEmpty else { return Data() }
 
