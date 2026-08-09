@@ -29,6 +29,10 @@ class SPTPlayerTrackHook: ClassHook<NSObject> {
                uriString.hasPrefix("spotify:track:") {
                 let trackId = uriString.replacingOccurrences(of: "spotify:track:", with: "")
                 if !trackId.isEmpty {
+                    // Feed the cache pin enforcer's current-track so it can
+                    // learn file-id keys while a pinned track plays. Main
+                    // thread only — the cache hooks read it under a lock.
+                    CachePinState.shared.noteCurrentTrack(trackId)
                     prefetchLyricsIfNeeded(trackId: trackId)
                 }
             }

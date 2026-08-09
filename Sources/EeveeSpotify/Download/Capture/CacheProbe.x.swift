@@ -2,16 +2,23 @@ import Foundation
 import Orion
 import ObjectiveC.runtime
 
-// [EeveeDownload spike] Step 0: observation-only cache probe.
+// [EeveeDownload spike] Step 1: cache probe + per-track pin enforcer.
 //
 // Spotify's audio-key cache is a thin wrapper over the open-source
 // SPTPersistentCache (class name "SPTPersistentCache", Apache-2.0, ships inside
-// Spotify). To prepare for a per-track cache-pinning feature (a later step: TTL
-// bump / lock-stamping), we first need to learn, on-device, which records carry
-// audio-key / audio-byte payloads and what their key shapes look like.
+// Spotify). Step 0 probed the cache to learn which records carry audio-key /
+// audio-byte payloads. Step 1 adds the PIN ENFORCER: records whose key belongs
+// to a pinned track (see PinnedTracksStore) are stored with an effectively
+// infinite TTL and locked, so they survive both the TTL expiry check and the
+// size-LRU eviction — the track keeps replaying from cache without re-fetching.
+// Unpinning stops the protection and the next GC reclaims the record (on-demand
+// cleanup, per song). This is pure client-side cache retention: it only decides
+// how long Spotify's already-downloaded records live on the device. No new
+// downloads, no server entitlements.
 //
-// This probe is PURE OBSERVATION: every hooked method forwards to `orig` with
-// identical arguments and never alters TTLs, lock state, or control flow.
+// Observation is still on: all pinned/unpinned events and cache activity are
+// logged through DownloadLogger (throttled). Set EEVEE_DISABLE_CACHE_PIN=1 to
+// keep the probe observation-only and disable enforcement.
 //
 // The exact ObjC encodings on Spotify 9.0.80 are unknown. Orion refuses
 // mismatched hooks non-fatally (the repo handleError override logs and
@@ -93,6 +100,114 @@ private final class CacheProbeStats {
     }
 }
 
+// MARK: - Pin enforcement state
+
+/// Thread-safe state backing the pin enforcer.
+///
+/// - `currentTrackId` is fed from the MAIN thread (SPTPlayerTrackHook.URI()),
+///   never from the cache callback queue — the player objects are
+///   main-thread-bound, and reading them from a background queue is exactly
+///   the type confusion that caused the `__NSMallocBlock__ _fastCStringContents:`
+///   crash (bridged block treated as a string).
+/// - `learnedKeysByTrack` records keys observed while a PINNED track was
+///   current, so records stored under file-id / GID shapes (rather than the
+///   base62 id) are still recognized and pinned.
+/// - `unpinnedKeys` lets a later unpin release the lock on the next touch, so
+///   the GC can reclaim the record (per-song on-demand cleanup).
+final class CachePinState {
+    static let shared = CachePinState()
+
+    private let lock = NSLock()
+
+    private var currentTrackId: String?
+    private var learnedKeysByTrack: [String: Set<String>] = [:]
+    private var lockedKeys: Set<String> = []
+    private var unpinnedKeys: Set<String> = []
+
+    private let maxLearnedKeysPerTrack = 256
+
+    private init() {}
+
+    // MARK: Current track (main thread only)
+
+    func noteCurrentTrack(_ trackId: String?) {
+        lock.lock()
+        defer { lock.unlock() }
+        currentTrackId = trackId.map { PinnedTracksStore.normalize($0) }
+    }
+
+    // MARK: Key learning (cache callback queue)
+
+    /// Records `key` if a pinned track is currently playing. The key must look
+    /// like a track/file id (32-hex GID, 40-hex file id, 22-char base62) —
+    /// image records (`{W,H}` suffixes, SPTOnDemandSetCacheKey etc.) are
+    /// excluded so they are never pinned.
+    func learnKeyIfPinned(_ key: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let track = currentTrackId, PinnedTracksStore.shared.isPinned(track) else { return }
+        guard CachePinState.isLearnableKey(key) else { return }
+        guard learnedKeysByTrack[track, default: []].count < maxLearnedKeysPerTrack else { return }
+        learnedKeysByTrack[track, default: []].insert(key)
+    }
+
+    /// True if the key belongs to a pinned track: either the key itself is in
+    /// the pin set (base62 / normalized form), or it was learned while a
+    /// pinned track was playing (file-id / GID form).
+    func isPinnedKey(_ key: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if PinnedTracksStore.shared.isPinned(key) { return true }
+        return learnedKeysByTrack.values.contains { $0.contains(key) }
+    }
+
+    // MARK: Lock bookkeeping (avoid re-locking every load)
+
+    /// Returns true the first time a key is marked locked this session.
+    @discardableResult
+    func markLocked(_ key: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return lockedKeys.insert(key).inserted
+    }
+
+    // MARK: Unpin (per-song cleanup)
+
+    /// Called by the unpin UI. Remembers the track's learned keys so the next
+    /// cache touch releases their lock and the GC reclaims them.
+    func noteUnpin(trackId: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        let normalized = PinnedTracksStore.normalize(trackId)
+        if let keys = learnedKeysByTrack.removeValue(forKey: normalized) {
+            unpinnedKeys.formUnion(keys)
+            lockedKeys.subtract(keys)
+        }
+    }
+
+    func isUnpinned(_ key: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return unpinnedKeys.contains(key)
+    }
+
+    func forgetUnpinned(_ key: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        unpinnedKeys.remove(key)
+    }
+
+    // MARK: Helpers
+
+    private static func isLearnableKey(_ desc: String) -> Bool {
+        let lowered = desc.lowercased()
+        if lowered.range(of: "^[0-9a-f]{32}$", options: .regularExpression) != nil { return true }
+        if lowered.range(of: "^[0-9a-f]{40}$", options: .regularExpression) != nil { return true }
+        if desc.range(of: "^[0-9a-zA-Z]{22}$", options: .regularExpression) != nil { return true }
+        return false
+    }
+}
+
 // MARK: - Hook
 
 class SPTPersistentCacheProbeHook: ClassHook<NSObject> {
@@ -101,17 +216,61 @@ class SPTPersistentCacheProbeHook: ClassHook<NSObject> {
 
     private static let throttle = CacheProbeThrottle()
     private static let stats = CacheProbeStats()
+    private static let pinState = CachePinState.shared
+
+    /// Pin enforcement kill-switch (EEVEE_DISABLE_CACHE_PIN=1 → probe only).
+    fileprivate static let pinEnabled: Bool = !eeveeEnvFlag("EEVEE_DISABLE_CACHE_PIN")
 
     // MARK: store
 
     func storeData(_ data: AnyObject, forKey key: AnyObject, ttl: UInt64, locked: Bool, withCallback callback: AnyObject, onQueue queue: AnyObject) {
+        let keyDesc = Self.describeKey(key)
+        Self.pinState.learnKeyIfPinned(keyDesc)
+
+        // Pinned track: stamp an effectively infinite TTL + locked so the
+        // record survives both the TTL expiry check and size-LRU eviction.
+        if Self.pinEnabled, Self.pinState.isPinnedKey(keyDesc) {
+            if Self.throttle.shouldLog(key: keyDesc, method: "pin-store") {
+                DownloadLogger.shared.log("[PROBE][cache][PIN] store pinned key=\(keyDesc.prefix(200)) ttl=UINT64_MAX locked=true")
+            }
+            orig.storeData(data, forKey: key, ttl: UInt64.max, locked: true, withCallback: callback, onQueue: queue)
+            return
+        }
+
+        // Just unpinned: drop the lock so GC can reclaim this record.
+        if Self.pinEnabled, Self.pinState.isUnpinned(keyDesc) {
+            Self.pinState.forgetUnpinned(keyDesc)
+            orig.storeData(data, forKey: key, ttl: ttl, locked: false, withCallback: callback, onQueue: queue)
+            return
+        }
+
         Self.logStore(data: data, key: key, ttl: ttl, locked: locked)
         orig.storeData(data, forKey: key, ttl: ttl, locked: locked, withCallback: callback, onQueue: queue)
     }
 
     func storeData(_ data: AnyObject, forKey key: AnyObject, locked: Bool, withCallback callback: AnyObject, onQueue queue: AnyObject) {
+        let keyDesc = Self.describeKey(key)
+        Self.pinState.learnKeyIfPinned(keyDesc)
+
         // Convenience variant without a TTL: ttl=0 means "use the global
         // default" in SPTPersistentCache, so it is reported as ttl=0.
+        // Pinned: force locked=true — locked records bypass the TTL expiry
+        // check and are never GC'd or size-LRU-evicted (per SPTPersistentCache:
+        // isDataCanBeReturnedWithHeader = !(isDataExpired && refCount == 0)).
+        if Self.pinEnabled, Self.pinState.isPinnedKey(keyDesc) {
+            if Self.throttle.shouldLog(key: keyDesc, method: "pin-store") {
+                DownloadLogger.shared.log("[PROBE][cache][PIN] store pinned (convenience) key=\(keyDesc.prefix(200)) locked=true")
+            }
+            orig.storeData(data, forKey: key, locked: true, withCallback: callback, onQueue: queue)
+            return
+        }
+
+        if Self.pinEnabled, Self.pinState.isUnpinned(keyDesc) {
+            Self.pinState.forgetUnpinned(keyDesc)
+            orig.storeData(data, forKey: key, locked: false, withCallback: callback, onQueue: queue)
+            return
+        }
+
         Self.logStore(data: data, key: key, ttl: 0, locked: locked)
         orig.storeData(data, forKey: key, locked: locked, withCallback: callback, onQueue: queue)
     }
@@ -119,6 +278,25 @@ class SPTPersistentCacheProbeHook: ClassHook<NSObject> {
     // MARK: load / lock / unlock
 
     func loadDataForKey(_ key: AnyObject, withCallback callback: AnyObject, onQueue queue: AnyObject) {
+        let keyDesc = Self.describeKey(key)
+        Self.pinState.learnKeyIfPinned(keyDesc)
+
+        // If a pinned key is loaded but wasn't stored locked (e.g. it was
+        // cached before pinning), lock it now so the load-time expiry check
+        // still returns it. We pass a no-op callback — the load callback must
+        // NOT be reused for the lock response (different response type).
+        if Self.pinEnabled, Self.pinState.isPinnedKey(keyDesc), Self.pinState.markLocked(keyDesc) {
+            DownloadLogger.shared.log("[PROBE][cache][PIN] load-lock pinned key=\(keyDesc.prefix(200))")
+            orig.lockDataForKeys([key], callback: Self.noopCallback(), onQueue: queue)
+        }
+
+        // Recently unpinned key: release the lock so GC reclaims it.
+        if Self.pinEnabled, Self.pinState.isUnpinned(keyDesc) {
+            Self.pinState.forgetUnpinned(keyDesc)
+            DownloadLogger.shared.log("[PROBE][cache][PIN] load-unlock unpinned key=\(keyDesc.prefix(200))")
+            orig.unlockDataForKeys([key], callback: Self.noopCallback(), onQueue: queue)
+        }
+
         Self.logAccess(key: key, action: "load")
         orig.loadDataForKey(key, withCallback: callback, onQueue: queue)
     }
@@ -171,6 +349,14 @@ class SPTPersistentCacheProbeHook: ClassHook<NSObject> {
     }
 
     // MARK: Internals
+
+    /// No-op block used for internal lock/unlock bookkeeping calls. The
+    /// original load callback must never be reused for a lock response — the
+    /// response object types differ and would be type-confused.
+    private static func noopCallback() -> AnyObject {
+        let block: @convention(block) (AnyObject) -> Void = { _ in }
+        return block as AnyObject
+    }
 
     private static func logStore(data: AnyObject, key: AnyObject, ttl: UInt64, locked: Bool) {
         let keyDesc = describeKey(key)
@@ -239,7 +425,7 @@ func activateCacheProbe() {
     }
     CacheProbeGroup().activate()
     logCacheProbeSelectors()
-    DownloadLogger.shared.log("[PROBE][cache] cache probe armed")
+    DownloadLogger.shared.log("[PROBE][cache] cache probe armed (pin enforcement \(SPTPersistentCacheProbeHook.pinEnabled ? "ON" : "OFF"))")
 }
 
 /// Logs which of the selectors we attempt actually exist on the target class —
