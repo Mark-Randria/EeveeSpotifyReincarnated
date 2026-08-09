@@ -115,39 +115,96 @@ struct EeveeCachingSettingsView: View {
     
     // MARK: - Pinned songs
     
+    private let pinnedSongsFooterText = "Pinned songs are protected from cache cleanup. Removing a pin lets Spotify reclaim the storage."
+    
     @ViewBuilder private func pinnedSongsSection() -> some View {
-        Section(
-            header: Text("Pinned songs"),
-            footer: Text("Pinned songs are protected from cache cleanup. Removing a pin lets Spotify reclaim the storage.")
-        ) {
-            if viewModel.pinnedTracks.isEmpty {
+        if viewModel.pinnedTracks.isEmpty {
+            Section(
+                header: pinnedSongsHeader(title: "Pinned songs"),
+                footer: Text(pinnedSongsFooterText)
+            ) {
                 Text("No pinned songs")
                     .foregroundColor(.secondary)
             }
-            else {
-                ForEach(viewModel.pinnedTracks, id: \.self) { trackId in
-                    HStack(spacing: 12) {
-                        Text(trackId)
-                            .font(.system(.footnote, design: .monospaced))
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                        
-                        Spacer()
-                        
-                        Button {
-                            viewModel.unpin(trackId)
-                        } label: {
-                            Image(systemName: "trash")
-                                .foregroundColor(.red)
-                        }
-                        // Keep the button tap scoped to the icon instead of the
-                        // whole list row.
-                        .buttonStyle(BorderlessButtonStyle())
+        }
+        else {
+            ForEach(viewModel.groupedPinnedTracks, id: \.header) { group in
+                Section(
+                    header: pinnedSongsHeader(title: group.header),
+                    footer: viewModel.groupingMode == .none ? Text(pinnedSongsFooterText) : nil
+                ) {
+                    ForEach(group.tracks, id: \.id) { track in
+                        pinnedTrackRow(track)
                     }
-                    .padding(.vertical, 5)
                 }
             }
         }
+    }
+    
+    private func pinnedSongsHeader(title: String) -> some View {
+        HStack {
+            Text(title)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            
+            Spacer()
+            
+            Picker("", selection: $viewModel.groupingMode) {
+                ForEach(PinnedGrouping.allCases, id: \.self) { grouping in
+                    Text(groupingLabel(grouping)).tag(grouping)
+                }
+            }
+            .pickerStyle(MenuPickerStyle())
+            .labelsHidden()
+            .font(.footnote)
+        }
+    }
+    
+    private func groupingLabel(_ grouping: PinnedGrouping) -> String {
+        switch grouping {
+        case .none: return "None"
+        case .artist: return "Artist"
+        case .genre: return "Genre"
+        case .mood: return "Mood"
+        }
+    }
+    
+    private func pinnedTrackRow(_ track: PinnedTrack) -> some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                if let title = track.title {
+                    Text(title)
+                        .font(.subheadline)
+                        .lineLimit(1)
+                }
+                else {
+                    Text(track.id)
+                        .font(.system(.footnote, design: .monospaced))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                
+                if let artist = track.artist, !artist.isEmpty {
+                    Text(artist)
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            
+            Spacer()
+            
+            Button {
+                viewModel.unpin(track.id)
+            } label: {
+                Image(systemName: "trash")
+                    .foregroundColor(.red)
+            }
+            // Keep the button tap scoped to the icon instead of the
+            // whole list row.
+            .buttonStyle(BorderlessButtonStyle())
+        }
+        .padding(.vertical, 5)
     }
     
     // MARK: - Info
