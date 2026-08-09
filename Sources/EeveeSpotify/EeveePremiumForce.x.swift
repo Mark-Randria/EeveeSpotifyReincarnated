@@ -73,6 +73,20 @@ private func forcedPremiumString(forKey key: String) -> String? {
     }
 }
 
+private func forcedCacheString(forKey key: String) -> String? {
+    switch key {
+    // Endless caching: extend audio key-cache retention far beyond the default
+    // 30-minute wall so replaying a track doesn't re-download its audio.
+    case "key-caching-max-offline-seconds":        return "31536000"
+    case "key-caching-auto-offline":               return "1"
+    case "key-caching-max-count":                  return "100000"
+    // Enable the offline-capable key path (premium force intends these anyway).
+    case "offline":                                return "1"
+    case "on-demand":                              return "1"
+    default:                                       return nil
+    }
+}
+
 private let stripKeys: Set<String> = [
     "payment-state",
     "last-premium-activation-date",
@@ -115,6 +129,30 @@ private func rewritePremiumDict(_ dict: NSDictionary) -> NSDictionary {
     return mutable
 }
 
+private func rewriteCacheDict(_ dict: NSDictionary) -> NSDictionary {
+    let mutable = NSMutableDictionary(dictionary: dict)
+    var changed = 0
+
+    for (k, _) in dict {
+        guard let key = k as? String, let forced = forcedCacheString(forKey: key) else { continue }
+        let cur = mutable[key] as? String
+        if cur != forced { mutable[key] = forced; changed += 1 }
+    }
+
+    if changed > 0 {
+        NSLog("[FORCE][PS.dict] cache-rewrote %d keys (in=%lu out=%lu)", changed, dict.count, mutable.count)
+    }
+    return mutable
+}
+
+private func rewriteProductStateDict(_ dict: NSDictionary) -> NSDictionary {
+    var result = enableDictRewrite ? rewritePremiumDict(dict) : dict
+    if enableCacheDictRewrite {
+        result = rewriteCacheDict(result)
+    }
+    return result
+}
+
 private let premiumWatchKeys: [String] = [
     "type", "catalogue", "product", "name",
     "ads", "audio-ad-frequency", "video-ad-frequency",
@@ -145,16 +183,16 @@ class CoreProductStateHook: ClassHook<NSObject> {
 
     func setOriginalValues(_ dict: NSDictionary) {
         passiveLogProductState("setOriginal", dict)
-        orig.setOriginalValues(enableDictRewrite ? rewritePremiumDict(dict) : dict)
+        orig.setOriginalValues(rewriteProductStateDict(dict))
     }
 
     func setOverrides(_ dict: NSDictionary) {
         passiveLogProductState("setOverrides", dict)
-        orig.setOverrides(enableDictRewrite ? rewritePremiumDict(dict) : dict)
+        orig.setOverrides(rewriteProductStateDict(dict))
     }
 
     func initWithValuesDict(_ dict: NSDictionary, scheduler: UnsafeRawPointer) -> Any {
-        let d = enableDictRewrite ? rewritePremiumDict(dict) : dict
+        let d = rewriteProductStateDict(dict)
         return orig.initWithValuesDict(d, scheduler: scheduler)
     }
 
@@ -174,17 +212,17 @@ class CoreProductStateHook: ClassHook<NSObject> {
 
     func values() -> NSDictionary {
         let d = orig.values()
-        return enableDictRewrite ? rewritePremiumDict(d) : d
+        return rewriteProductStateDict(d)
     }
 
     func originalValues() -> NSDictionary {
         let d = orig.originalValues()
-        return enableDictRewrite ? rewritePremiumDict(d) : d
+        return rewriteProductStateDict(d)
     }
 
     func valuesDictFromMap(_ map: UnsafeRawPointer) -> NSDictionary {
         let d = orig.valuesDictFromMap(map)
-        return enableDictRewrite ? rewritePremiumDict(d) : d
+        return rewriteProductStateDict(d)
     }
 
     func valuesDictFromChangedKeys(_ keys: UnsafeRawPointer) -> NSDictionary {
@@ -226,17 +264,19 @@ private func swizzleBoolGetter(_ cls: AnyClass, _ name: String, _ value: Bool) {
 struct EeveePremiumForceGroup: HookGroup {}
 
 private let enableDictRewrite = false
+private let enableCacheDictRewrite = true
 private let enableDirectGetters = false
 private let enableAdsHook = false
 private let enablePassiveProductStateLog = true
 
 func activateEeveePremiumForce() {
-    NSLog("[FORCE] activating dict=%@ getters=%@ ads=%@ passiveLog=%@",
+    NSLog("[FORCE] activating dict=%@ cacheDict=%@ getters=%@ ads=%@ passiveLog=%@",
           enableDictRewrite   ? "on" : "off",
+          enableCacheDictRewrite ? "on" : "off",
           enableDirectGetters ? "on" : "off",
           enableAdsHook       ? "on" : "off",
           enablePassiveProductStateLog ? "on" : "off")
-    guard enableDictRewrite || enableDirectGetters || enableAdsHook || enablePassiveProductStateLog else {
+    guard enableDictRewrite || enableCacheDictRewrite || enableDirectGetters || enableAdsHook || enablePassiveProductStateLog else {
         return
     }
     // This ran completely unguarded before - unlike every other hook group in this
