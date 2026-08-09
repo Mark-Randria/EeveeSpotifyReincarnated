@@ -36,11 +36,11 @@ struct EeveeDownloadsSettingsView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                     
                     VStack(alignment: .leading, spacing: 3) {
-                        Text(track.trackTitle())
+                        Text(track.title)
                             .font(.headline)
                             .lineLimit(1)
                         
-                        Text(EeveeSpotify.hookTarget == .lastAvailableiOS14 ? track.artistTitle() : track.artistName())
+                        Text(track.artist)
                             .font(.subheadline)
                             .foregroundColor(.secondary)
                             .lineLimit(1)

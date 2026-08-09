@@ -8,8 +8,11 @@ class EeveeDownloadsSettingsViewModel: ObservableObject {
     
     private var cancellables = Set<AnyCancellable>()
     
-    var currentTrack: SPTPlayerTrack? {
-        statefulPlayer?.currentTrack() ?? nowPlayingScrollViewController?.loadedTrack
+    /// Current track with a 9.1.x-safe fallback chain (player globals are nil on
+    /// 9.1.x — see resume.md §4.1; falls back to the color-lyrics URL capture +
+    /// MPNowPlayingInfoCenter via `resolveCurrentTrackInfo()`).
+    var currentTrack: CurrentTrackInfo? {
+        resolveCurrentTrackInfo()
     }
     
     init() {

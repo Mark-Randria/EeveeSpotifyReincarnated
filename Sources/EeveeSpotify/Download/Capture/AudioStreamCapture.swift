@@ -191,16 +191,13 @@ final class AudioStreamCapture {
     /// ObjC/UIKit objects, so any background caller hops to the main thread. This
     /// is acceptable because it is only reached for stream URLs that carry no GID
     /// and key exchanges that lack a GID — both rare — and never per chunk.
+    ///
+    /// On 9.1.x the player globals are never set (resume.md §4.1), so this falls
+    /// back to the color-lyrics URL capture (`capturedTrackId`) via
+    /// `resolveCurrentTrackInfo()` — the same 9.1.x-safe chain the Downloads
+    /// pipeline uses.
     func currentTrackID() -> String? {
-        let track: SPTPlayerTrack?
-        if Thread.isMainThread {
-            track = statefulPlayer?.currentTrack() ?? nowPlayingScrollViewController?.loadedTrack
-        } else {
-            track = DispatchQueue.main.sync {
-                statefulPlayer?.currentTrack() ?? nowPlayingScrollViewController?.loadedTrack
-            }
-        }
-        return track?.trackIdentifier
+        resolveCurrentTrackInfo()?.identifier
     }
 
     // MARK: - Internals

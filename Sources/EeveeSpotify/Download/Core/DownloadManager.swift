@@ -124,11 +124,11 @@ final class DownloadManager {
                 return
             }
 
-            DownloadLogger.shared.log("download attempt: track=\(track.trackIdentifier)")
+            DownloadLogger.shared.log("download attempt: track=\(track.identifier)")
 
-            guard let stream = resolveStreamInfo(forTrackIdentifier: track.trackIdentifier) else {
+            guard let stream = resolveStreamInfo(forTrackIdentifier: track.identifier) else {
                 DownloadLogger.shared.log(
-                    "download attempt: no stream info for \(track.trackIdentifier), latest=\(AudioStreamCapture.shared.latestStream?.trackGID ?? "nil")"
+                    "download attempt: no stream info for \(track.identifier), latest=\(AudioStreamCapture.shared.latestStream?.trackGID ?? "nil")"
                 )
                 setState(.failed("No audio stream captured for this track yet — play it first"))
                 return
@@ -140,8 +140,8 @@ final class DownloadManager {
             }
 
             let fileName = DownloadManager.sanitizedFileName(
-                artist: DownloadManager.currentArtist(from: track),
-                title: track.trackTitle()
+                artist: track.artist,
+                title: track.title
             )
             let directory = try downloadsDirectory()
 
@@ -174,17 +174,12 @@ final class DownloadManager {
         }
     }
 
-    /// `statefulPlayer` / `nowPlayingScrollViewController` are main-thread-bound
-    /// ObjC/UIKit objects; this download queue is a background dispatch queue, so
-    /// hop to the main thread (guarding against being called ON main, e.g. when
-    /// the Task runs on the main actor).
-    private func resolveCurrentTrack() -> SPTPlayerTrack? {
-        if Thread.isMainThread {
-            return statefulPlayer?.currentTrack() ?? nowPlayingScrollViewController?.loadedTrack
-        }
-        return DispatchQueue.main.sync {
-            statefulPlayer?.currentTrack() ?? nowPlayingScrollViewController?.loadedTrack
-        }
+    /// Resolves the current track with a build-agnostic fallback chain (player
+    /// globals on 9.0.x; color-lyrics URL capture + MPNowPlayingInfoCenter on
+    /// 9.1.x where the player globals are never set — see resume.md §4.1). The
+    /// resolver itself hops to the main thread when needed.
+    private func resolveCurrentTrack() -> CurrentTrackInfo? {
+        resolveCurrentTrackInfo()
     }
 
     // MARK: - Stream info resolution
@@ -208,15 +203,6 @@ final class DownloadManager {
     }
 
     // MARK: - Helpers
-
-    private static func currentArtist(from track: SPTPlayerTrack) -> String {
-        // `artistTitle()` is the non-localized fallback on older iOS 14 targets,
-        // mirroring the pattern used in CustomLyrics.
-        if EeveeSpotify.hookTarget == .lastAvailableiOS14 {
-            return track.artistTitle()
-        }
-        return track.artistName()
-    }
 
     static func sanitizedFileName(artist: String, title: String) -> String {
         let forbidden = CharacterSet(charactersIn: "/:").union(.controlCharacters)

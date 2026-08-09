@@ -440,10 +440,14 @@ func getLyricsDataForCurrentTrack(_ originalPath: String, originalLyrics: Lyrics
         throw LyricsError.noCurrentTrack
     }
 
+    // 9.1.x-safe current-track feed: player globals are nil on 9.1.x, so the
+    // color-lyrics URL path is the ONLY reliable "now playing" signal. Record it
+    // here (clearing stale metadata when the track changes); the Downloads
+    // settings + download pipeline read it via `resolveCurrentTrackInfo()`.
     if capturedTrackId != trackIdentifier {
         capturedTrackTitle = nil
         capturedArtistName = nil
-        capturedTrackId = nil
+        capturedTrackId = trackIdentifier
     }
 
     // Use a prefetched result if one finished in time for this track.
