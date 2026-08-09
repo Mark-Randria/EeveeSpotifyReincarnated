@@ -129,19 +129,6 @@ struct EeveeSettingsView: View {
                 )
             }
 
-            Button {
-                pushSettingsController(
-                    with: EeveeDownloadsSettingsView(),
-                    title: "Downloads"
-                )
-            } label: {
-                NavigationSectionView(
-                    color: .green,
-                    title: "Downloads",
-                    imageSystemName: "arrow.down.circle.fill"
-                )
-            }
-
             //
 
             Section(header: Text("debug_title".localized), footer: Text("debug_section_footer".localized)) {
