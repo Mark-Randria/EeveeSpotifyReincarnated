@@ -1,7 +1,7 @@
 import Foundation
 
 /// Appends diagnostics to a log file inside the app's Documents folder so the
-/// [EeveeDownload] spike logs can be read on-device (LiveContainer exposes the
+/// [EeveeCache] spike logs can be read on-device (LiveContainer exposes the
 /// container's Documents via "Open Data Folder", and plain iOS via the Files app
 /// when documents sharing is enabled).
 ///
@@ -16,7 +16,7 @@ final class DownloadLogger {
 
     private static let maxLogSize: UInt64 = 512 * 1024
 
-    private let queue = DispatchQueue(label: "eevee.download-logger.queue")
+    private let queue = DispatchQueue(label: "eevee.cache-logger.queue")
     private let logURL: URL
 
     // Only ever touched on `queue`.
@@ -29,7 +29,7 @@ final class DownloadLogger {
         ).first!
 
         let directory = documents.appendingPathComponent(
-            "EeveeSpotifyDownloads",
+            "EeveeSpotifyCache",
             isDirectory: true
         )
 
@@ -47,7 +47,7 @@ final class DownloadLogger {
 
     func log(_ message: String) {
         queue.async {
-            self.append("[EeveeDownload] \(message)")
+            self.append("[EeveeCache] \(message)")
         }
     }
 

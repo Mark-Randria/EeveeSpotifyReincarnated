@@ -255,10 +255,9 @@ struct EeveeSpotify: Tweak {
         // other Eevee path is disabled.
         activateEeveePremiumForce()
 
-        // [EeveeDownload spike] Step 0: observation-only cache probe (identifies
-        // audio-key / audio-byte records on device). Pure observation + storage;
-        // the actual TTL/lock stamping is a later step. Initialize the pin store
-        // so it loads persisted ids before any probe classification runs.
+        // [EeveeCache spike] Cache probe + pin enforcer: observes Spotify's
+        // SPTPersistentCache and pins selected tracks for indefinite retention.
+        // Initialize the pin store so persisted ids load before probe runs.
         _ = PinnedTracksStore.shared
         if !eeveeEnvFlag("EEVEE_DISABLE_CACHE_PROBE") {
             activateCacheProbe()

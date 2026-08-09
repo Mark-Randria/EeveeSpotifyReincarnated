@@ -125,7 +125,7 @@ struct EeveeSettingsView: View {
                 NavigationSectionView(
                     color: .green,
                     title: "Caching",
-                    imageSystemName: "arrow.down.circle.fill"
+                    imageSystemName: "archivebox.fill"
                 )
             }
 
