@@ -88,7 +88,7 @@ struct EeveeCachingSettingsView: View {
                     
                     Spacer()
                     
-                    Toggle(isOn: .constant(false))
+                    Toggle("", isOn: .constant(false))
                         .disabled(true)
                 }
             }

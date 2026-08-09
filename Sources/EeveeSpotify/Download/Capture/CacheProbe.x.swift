@@ -287,14 +287,14 @@ class SPTPersistentCacheProbeHook: ClassHook<NSObject> {
         // NOT be reused for the lock response (different response type).
         if Self.pinEnabled, Self.pinState.isPinnedKey(keyDesc), Self.pinState.markLocked(keyDesc) {
             DownloadLogger.shared.log("[PROBE][cache][PIN] load-lock pinned key=\(keyDesc.prefix(200))")
-            orig.lockDataForKeys([key], callback: Self.noopCallback(), onQueue: queue)
+            orig.lockDataForKeys([key] as NSArray, callback: Self.noopCallback(), onQueue: queue)
         }
 
         // Recently unpinned key: release the lock so GC reclaims it.
         if Self.pinEnabled, Self.pinState.isUnpinned(keyDesc) {
             Self.pinState.forgetUnpinned(keyDesc)
             DownloadLogger.shared.log("[PROBE][cache][PIN] load-unlock unpinned key=\(keyDesc.prefix(200))")
-            orig.unlockDataForKeys([key], callback: Self.noopCallback(), onQueue: queue)
+            orig.unlockDataForKeys([key] as NSArray, callback: Self.noopCallback(), onQueue: queue)
         }
 
         Self.logAccess(key: key, action: "load")
