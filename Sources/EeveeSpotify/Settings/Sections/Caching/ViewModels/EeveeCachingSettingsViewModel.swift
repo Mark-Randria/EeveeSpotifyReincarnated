@@ -159,6 +159,15 @@ class EeveeCachingSettingsViewModel: ObservableObject {
         CachePinState.shared.noteUnpin(trackId: id)
         refresh()
     }
+
+    var lyricsCacheEnabled: Bool {
+        get { LyricsDiskCache.shared.isEnabled }
+        set { LyricsDiskCache.shared.isEnabled = newValue }
+    }
+
+    func clearLyricsCache() {
+        LyricsDiskCache.shared.clear()
+    }
     
     func refresh() {
         pinnedTracks = PinnedTracksStore.shared.allPinned()

@@ -9,6 +9,7 @@ struct EeveeCachingSettingsView: View {
             currentTrackSection()
             pinActionSection()
             pinnedSongsSection()
+            lyricsCacheSection()
             infoSection()
             
             SpacerView()
@@ -205,6 +206,40 @@ struct EeveeCachingSettingsView: View {
             .buttonStyle(BorderlessButtonStyle())
         }
         .padding(.vertical, 5)
+    }
+    
+    // MARK: - Lyrics cache
+    
+    private func lyricsCacheSection() -> some View {
+        Section(
+            footer: Text("Synced lyrics are stored on device so replays load instantly, even offline.")
+        ) {
+            Toggle(
+                isOn: Binding(
+                    get: { viewModel.lyricsCacheEnabled },
+                    set: { viewModel.lyricsCacheEnabled = $0 }
+                )
+            ) {
+                Text("Cache lyrics")
+                    .font(.subheadline)
+            }
+            
+            Button {
+                viewModel.clearLyricsCache()
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: "trash")
+                        .foregroundColor(.red)
+                    
+                    Text("Clear lyrics cache")
+                        .font(.subheadline)
+                        .foregroundColor(.red)
+                }
+            }
+            // Keep the button tap scoped to the row instead of the whole section.
+            .buttonStyle(BorderlessButtonStyle())
+            .padding(.vertical, 5)
+        }
     }
     
     // MARK: - Info

@@ -407,6 +407,7 @@ func prefetchLyricsIfNeeded(trackId: String) {
             if let data = try? lyrics.serializedData() {
                 prefetchedResult = PrefetchedLyrics(trackId: trackId, data: data)
                 storePrefetchSuccess(trackId, data: data)
+                LyricsDiskCache.shared.store(data: data, for: trackId, source: UserDefaults.lyricsSource.description)
                 writeDebugLog("[Lyrics] prefetch complete for \(trackId)")
             } else {
                 storePrefetchFailure(trackId)
@@ -467,6 +468,14 @@ func getLyricsDataForCurrentTrack(_ originalPath: String, originalLyrics: Lyrics
         return cached
     }
 
+    // Persistent cache: instant replay + offline lyrics. Keyed by source so a
+    // cached Genius result is never served after switching to LRCLIB.
+    if LyricsDiskCache.shared.isEnabled,
+       let diskData = LyricsDiskCache.shared.cachedData(for: trackIdentifier, source: UserDefaults.lyricsSource.description) {
+        writeDebugLog("[Lyrics] using disk cache for \(trackIdentifier)")
+        return diskData
+    }
+
     var lyrics = try loadCustomLyricsForTrackId(trackIdentifier)
     
     let lyricsColorsSettings = UserDefaults.lyricsColors
@@ -496,5 +505,7 @@ func getLyricsDataForCurrentTrack(_ originalPath: String, originalLyrics: Lyrics
         }
     }
     
-    return try lyrics.serializedData()
+    let serialized = try lyrics.serializedData()
+    LyricsDiskCache.shared.store(data: serialized, for: trackIdentifier, source: UserDefaults.lyricsSource.description)
+    return serialized
 }
