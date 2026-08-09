@@ -311,18 +311,64 @@ private struct PrefetchedLyrics {
     let trackId: String
     let data: Data
 }
+
+private let prefetchStateLock = NSLock()
 private var prefetchedResult: PrefetchedLyrics?
 
 // Track ID currently being prefetched, to avoid duplicate background fetches.
 private var prefetchingTrackId: String?
+
+// Successful prefetches are kept for a few minutes so the constant URI() polls
+// from SPTPlayerTrackHook don't re-arm the same fetch after the handoff is
+// consumed. Without this, playback re-fetches lyrics in a tight loop.
+private var prefetchCache: [String: (data: Data, date: Date)] = [:]
+private let prefetchCacheTTL: TimeInterval = 10 * 60
+
+// Failed tracks are not retried for a short window (backoff), otherwise a
+// failing lyrics source (e.g. LRCLIB on a constrained network) is re-requested
+// dozens of times per second, flooding the network and stalling the app.
+private var prefetchFailedAt: [String: Date] = [:]
+private let prefetchFailureBackoff: TimeInterval = 60
+
+private func cachedPrefetchData(for trackId: String) -> Data? {
+    prefetchStateLock.lock()
+    defer { prefetchStateLock.unlock() }
+    guard let entry = prefetchCache[trackId] else { return nil }
+    guard Date().timeIntervalSince(entry.date) < prefetchCacheTTL else {
+        prefetchCache.removeValue(forKey: trackId)
+        return nil
+    }
+    return entry.data
+}
+
+private func prefetchBackedOff(_ trackId: String) -> Bool {
+    prefetchStateLock.lock()
+    defer { prefetchStateLock.unlock() }
+    guard let date = prefetchFailedAt[trackId] else { return false }
+    return Date().timeIntervalSince(date) < prefetchFailureBackoff
+}
+
+private func storePrefetchSuccess(_ trackId: String, data: Data) {
+    prefetchStateLock.lock()
+    prefetchCache[trackId] = (data, Date())
+    prefetchFailedAt.removeValue(forKey: trackId)
+    prefetchStateLock.unlock()
+}
+
+private func storePrefetchFailure(_ trackId: String) {
+    prefetchStateLock.lock()
+    prefetchFailedAt[trackId] = Date()
+    prefetchStateLock.unlock()
+}
 
 /// Kicks off a background lyrics fetch for `trackId` so the result is ready
 /// before Spotify fires its `/color-lyrics/v2` request.
 /// Safe to call multiple times — duplicate calls for the same track are ignored.
 func prefetchLyricsIfNeeded(trackId: String) {
     guard UserDefaults.lyricsSource.isReplacingLyrics else { return }
-    // Already have a result waiting, or already fetching — nothing to do.
-    if prefetchedResult?.trackId == trackId { return }
+    // Already have a fresh result, already fetching, or recently failed — nothing to do.
+    if cachedPrefetchData(for: trackId) != nil { return }
+    if prefetchBackedOff(trackId) { return }
     if prefetchingTrackId == trackId { return }
 
     prefetchingTrackId = trackId
@@ -360,9 +406,13 @@ func prefetchLyricsIfNeeded(trackId: String) {
 
             if let data = try? lyrics.serializedData() {
                 prefetchedResult = PrefetchedLyrics(trackId: trackId, data: data)
+                storePrefetchSuccess(trackId, data: data)
                 writeDebugLog("[Lyrics] prefetch complete for \(trackId)")
+            } else {
+                storePrefetchFailure(trackId)
             }
         } catch {
+            storePrefetchFailure(trackId)
             writeDebugLog("[Lyrics] prefetch failed for \(trackId): \(error)")
         }
     }
@@ -405,6 +455,14 @@ func getLyricsDataForCurrentTrack(_ originalPath: String, originalLyrics: Lyrics
         prefetchedResult = nil
         writeDebugLog("[Lyrics] using prefetched result for \(trackIdentifier)")
         return prefetched.data
+    }
+
+    // Reuse a recent prefetch (within TTL) even if the single-slot handoff was
+    // already consumed — stops the prefetch loop that hammered the lyrics
+    // provider with one fetch per URI() poll.
+    if let cached = cachedPrefetchData(for: trackIdentifier) {
+        writeDebugLog("[Lyrics] using cached result for \(trackIdentifier)")
+        return cached
     }
 
     var lyrics = try loadCustomLyricsForTrackId(trackIdentifier)

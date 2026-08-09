@@ -155,19 +155,13 @@ class LrclibLyricsRepository: LyricsRepository {
 
         var request = URLRequest(url: url)
 
-        // Some networks have broken/unroutable IPv6 paths to lrclib.net that cause
-        // ETIMEDOUT at the TCP layer for custom URLSession instances. Resolve to
-        // an IPv4 address explicitly and connect to it directly (TLS hostname
-        // validation against the original host is handled by LrclibTLSDelegate).
-        if let host = url.host, let ip = resolveIPv4(host) {
-            var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
-            components?.host = ip
-            if let ipUrl = components?.url {
-                request = URLRequest(url: ipUrl)
-                request.setValue(host, forHTTPHeaderField: "Host")
-            }
-        }
-
+        // Attempt the plain hostname URL FIRST. Some networks (notably
+        // constrained cellular paths) fail TLS against Cloudflare's raw IPs
+        // (SSL -9824 / ETIMEDOUT), so the previous IPv4-first order made every
+        // request eat a full failed round trip before succeeding — doubling
+        // latency and, during prefetch storms, exhausting the URLSession queue.
+        // IPv4-direct remains as a fallback for networks whose IPv6 path to
+        // lrclib.net is broken (the original motivation for this code).
         request.setValue(
             "EeveeSpotify v\(EeveeSpotify.version) https://github.com/whoeevee/EeveeSpotify",
             forHTTPHeaderField: "User-Agent"
@@ -186,25 +180,34 @@ class LrclibLyricsRepository: LyricsRepository {
         task.resume()
         semaphore.wait()
 
-        if error != nil, request.url != url {
-            // IPv4-direct attempt failed; retry with the original hostname URL.
-            writeDebugLog("[LRCLIB] IPv4-direct attempt failed (\(error!)), retrying via hostname")
+        if error != nil,
+           let host = url.host,
+           let ip = resolveIPv4(host) {
+            // Hostname attempt failed; retry via explicit IPv4 address (TLS
+            // hostname validation against the original host is handled by
+            // LrclibTLSDelegate).
+            writeDebugLog("[LRCLIB] hostname attempt failed (\(error!)), retrying IPv4-direct")
 
-            let fallbackSemaphore = DispatchSemaphore(value: 0)
-            var fallbackRequest = URLRequest(url: url)
-            fallbackRequest.setValue(
-                "EeveeSpotify v\(EeveeSpotify.version) https://github.com/whoeevee/EeveeSpotify",
-                forHTTPHeaderField: "User-Agent"
-            )
+            var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+            components?.host = ip
+            if let ipUrl = components?.url {
+                var ipRequest = URLRequest(url: ipUrl)
+                ipRequest.setValue(host, forHTTPHeaderField: "Host")
+                ipRequest.setValue(
+                    "EeveeSpotify v\(EeveeSpotify.version) https://github.com/whoeevee/EeveeSpotify",
+                    forHTTPHeaderField: "User-Agent"
+                )
 
-            let fallbackTask = session.dataTask(with: fallbackRequest) { response, _, err in
-                error = err
-                data = response
-                fallbackSemaphore.signal()
+                let fallbackSemaphore = DispatchSemaphore(value: 0)
+                let fallbackTask = session.dataTask(with: ipRequest) { response, _, err in
+                    error = err
+                    data = response
+                    fallbackSemaphore.signal()
+                }
+
+                fallbackTask.resume()
+                fallbackSemaphore.wait()
             }
-
-            fallbackTask.resume()
-            fallbackSemaphore.wait()
         }
 
         if let error = error {
