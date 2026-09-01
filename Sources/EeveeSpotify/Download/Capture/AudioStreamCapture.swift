@@ -55,6 +55,11 @@ final class AudioStreamCapture {
     /// carry it; replaying it with the bearer token makes our own re-resolution
     /// requests indistinguishable from the app's.
     private var _clientToken: String?
+    /// The app's `x-client-id` header value (the Spotify iOS client id —
+    /// `58bd3c95768941ea9eb4350aaa033eb3` in both HAR captures). The playplay
+    /// service binds the client-token to this id; replaying requests without it
+    /// gets HTTP 400 (the active resolver failed exactly that way on-device).
+    private var _clientID: String?
     /// Key (16 bytes) per 40-hex FILE id — captured from the playplay key
     /// exchange. Paired with the CDN URL by fileId (NOT by track): the app
     /// prefetches the next track's storage-resolve + playplay while the current
@@ -139,6 +144,7 @@ final class AudioStreamCapture {
         // is needed before any download can start.
         captureBearerToken(headers: headers)
         captureClientToken(headers: headers)
+        captureClientID(headers: headers)
 
         guard url.isAudioStreamURL else { return }
 
@@ -462,6 +468,32 @@ final class AudioStreamCapture {
         lock.unlock()
         if !alreadyCaptured {
             DownloadLogger.shared.log(" captured client-token (\(String(token.prefix(8)))...)")
+        }
+    }
+
+    /// The app's `x-client-id` header value, if any was seen on a request
+    /// (looked up case-insensitively). nil if not observed yet — the resolver
+    /// falls back to the known 9.1.70 client id constant.
+    var clientID: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _clientID
+    }
+
+    private func captureClientID(headers: [String: String]?) {
+        guard let id = headers?["x-client-id"] ?? headers?["X-Client-Id"] ?? headers?["X-Client-ID"],
+              !id.isEmpty
+        else {
+            return
+        }
+        lock.lock()
+        let alreadyCaptured = _clientID != nil
+        if !alreadyCaptured {
+            _clientID = id
+        }
+        lock.unlock()
+        if !alreadyCaptured {
+            DownloadLogger.shared.log(" captured x-client-id (\(String(id.prefix(8)))...)")
         }
     }
 

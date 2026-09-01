@@ -354,3 +354,46 @@ The playplay key exchange + storage-resolve DID happen in the app's traffic (HAR
    9.1.70 key deobfuscation (SpotiLoad-style) using the token.
 3. If `extended-metadata` returns no Track file (`.emptyMetadataResponse`),
    dump the response fields and re-check the TRACK_V4 wrapper walk.
+
+---
+
+## §13 feat/download-impl — round 3: playplay HTTP 400 + sticky failure state (2026-09-01)
+
+### On-device results (round 2 build)
+- ✅ extended-metadata TRACK_V4 replay WORKS: `fileIds=1c5f4e90…,fb3041bb…,d09bfcec…,1b9290e5…` — the
+  40-hex file ids are now resolved (4 files per track, matching the AudioFilesExtension).
+- ❌ playplay replay: `playplay responded with HTTP 400` for every fileId. A fresh HAR captured
+  during the attempt shows the SAME 4 fileIds requested at the same timestamps → those 4×400
+  requests are OURS, not the app's (the app made no playplay calls in that window).
+- The app's own playplay (round-1 HAR #484, byte-identical 30-byte body) gets 200. Difference
+  between the two requests = the HEADERS. 400 (not 403) = malformed request, not entitlement.
+
+### Fixes
+- `Download/Capture/AudioStreamCapture.swift` — capture the app's `x-client-id` header
+  (case-insensitive) like the client-token; expose `clientID`.
+- `Download/Core/SpotifyAPIResolver.swift` — replay requests now carry the app's identity
+  headers: `x-client-id` (live-captured, fallback constant
+  `58bd3c95768941ea9eb4350aaa033eb3`), `spotify-app-version: 9.1.70.1906`,
+  `app-platform: iOS`, `accept: */*`, exact UA `Spotify/9.1.70.1906 iOS/Version 16.1 (Build 20B82)`.
+  The playplay service binds the client-token to the client id; without `x-client-id` it cannot
+  validate → 400.
+- UI bug: `.failed`/`.finished` states rendered NO download button → after a failure the only
+  way back was restarting the app, and the error stayed visible across track changes.
+  - `EeveeDownloadsSettingsView.swift` — download button now also shown under the failed row
+    (retry) and the finished row (re-download).
+  - `EeveeDownloadsSettingsViewModel.swift` — subscribes to a new track-change notification and
+    clears stale terminal state for the previous track.
+  - `DownloadManager` — `trackDidChangeNotification` + `resetToIdleIfFinished()` (never touches
+    an in-flight `.downloading`).
+  - `Lyrics/CustomLyrics.x.swift` — `setCapturedCurrentTrack()` helper posts the notification
+    when `capturedTrackId` actually changes.
+
+### Next verification on device
+1. Expect `captured x-client-id (58bd3c95...)` in the log, then playplay 200 → storage-resolve →
+   CDN download. If playplay STILL 400s, capture a fresh HAR of the download attempt and diff
+   our request headers against the app's own playplay request byte-by-byte.
+2. If the download decrypts but the file is garbage: `Decrypt failed — key extraction may be
+   wrong` → the playplay KEY endpoint is obfuscated; next step is reversing the 9.1.70
+   deobfuscation with the version token.
+3. Failure retry: tap Download again after a failure (same or new track) must start a fresh
+   attempt; changing tracks must clear the stale error row.

@@ -76,8 +76,10 @@ struct EeveeDownloadsSettingsView: View {
                 progressRow(progress: progress)
             case .finished(let url):
                 finishedRow(url: url)
+                downloadButton()
             case .failed(let message):
                 failedRow(message: message)
+                downloadButton()
             }
         }
     }

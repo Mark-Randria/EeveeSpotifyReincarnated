@@ -17,6 +17,19 @@ var hasShownUnauthorizedPopUp = false
 private let geniusLyricsRepository = GeniusLyricsRepository()
 private let petitLyricsRepository = PetitLyricsRepository()
 
+/// Updates the captured current-track globals (the 9.1.x "now playing" signal
+/// read by `resolveCurrentTrackInfo()`) and posts the track-change notification
+/// so the Downloads UI can clear stale terminal state for the previous track.
+private func setCapturedCurrentTrack(_ trackId: String, title: String?, artist: String?) {
+    let changed = capturedTrackId != trackId
+    capturedTrackId = trackId
+    capturedTrackTitle = title
+    capturedArtistName = artist
+    if changed {
+        NotificationCenter.default.post(name: DownloadManager.trackDidChangeNotification, object: nil)
+    }
+}
+
 // Overload for 9.1.6 where we only have track ID from URL
 private func loadCustomLyricsForTrackId(_ trackId: String) throws -> Lyrics {
     
@@ -45,9 +58,7 @@ private func loadCustomLyricsForTrackId(_ trackId: String) throws -> Lyrics {
                 currentTitle = track.trackTitle()
                 currentArtist = track.artistName()
                 hasMetadata = true
-                capturedTrackId = trackId
-                capturedTrackTitle = currentTitle
-                capturedArtistName = currentArtist
+                setCapturedCurrentTrack(trackId, title: currentTitle, artist: currentArtist)
             }
         }
     }
@@ -69,9 +80,7 @@ private func loadCustomLyricsForTrackId(_ trackId: String) throws -> Lyrics {
             currentTitle = title
             currentArtist = artist
             hasMetadata = true
-            capturedTrackId = trackId
-            capturedTrackTitle = title
-            capturedArtistName = artist
+            setCapturedCurrentTrack(trackId, title: title, artist: artist)
         }
     }
 
@@ -81,9 +90,7 @@ private func loadCustomLyricsForTrackId(_ trackId: String) throws -> Lyrics {
             currentTitle = info.title
             currentArtist = info.artist
             hasMetadata = true
-            capturedTrackId = trackId
-            capturedTrackTitle = currentTitle
-            capturedArtistName = currentArtist
+            setCapturedCurrentTrack(trackId, title: currentTitle, artist: currentArtist)
         }
     }
 
@@ -445,9 +452,7 @@ func getLyricsDataForCurrentTrack(_ originalPath: String, originalLyrics: Lyrics
     // here (clearing stale metadata when the track changes); the Downloads
     // settings + download pipeline read it via `resolveCurrentTrackInfo()`.
     if capturedTrackId != trackIdentifier {
-        capturedTrackTitle = nil
-        capturedArtistName = nil
-        capturedTrackId = trackIdentifier
+        setCapturedCurrentTrack(trackIdentifier, title: nil, artist: nil)
     }
 
     // Use a prefetched result if one finished in time for this track.

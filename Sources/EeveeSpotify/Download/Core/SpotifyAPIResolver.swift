@@ -43,6 +43,21 @@ enum SpotifyAPIResolver {
         }
     }
 
+    /// The Spotify iOS client id (`x-client-id`), identical in both HAR
+    /// captures (logs.md). The playplay service validates the `client-token`
+    /// against it — replaying playplay without it returns HTTP 400. Preferred
+    /// value is the one captured live from the app's own requests
+    /// (`AudioStreamCapture.clientID`); this constant is the fallback.
+    static let defaultClientID = "58bd3c95768941ea9eb4350aaa033eb3"
+
+    /// App identity headers the 9.1.70 app sends on playplay / storage-resolve
+    /// / extended-metadata requests (from the HAR capture). Fidelity matters:
+    /// the server rejected our earlier playplay replay with HTTP 400 while the
+    /// app's own byte-identical-body request was accepted — the missing pieces
+    /// are these headers (above all `x-client-id`).
+    static let appVersion = "9.1.70.1906"
+    static let appUserAgent = "Spotify/9.1.70.1906 iOS/Version 16.1 (Build 20B82)"
+
     /// The playplay key request body, captured VERBATIM from the 9.1.70 HAR
     /// (logs.md, interactive request #484):
     ///
@@ -72,19 +87,22 @@ enum SpotifyAPIResolver {
         fileId: String,
         bearerToken: String,
         baseURL: String,
-        clientToken: String? = nil
+        clientToken: String? = nil,
+        clientID: String? = nil
     ) async throws -> (Data, URL) {
         let key = try await fetchAudioKey(
             fileId: fileId,
             bearerToken: bearerToken,
             baseURL: baseURL,
-            clientToken: clientToken
+            clientToken: clientToken,
+            clientID: clientID
         )
         let cdnURL = try await fetchCDNURL(
             fileId: fileId,
             bearerToken: bearerToken,
             baseURL: baseURL,
-            clientToken: clientToken
+            clientToken: clientToken,
+            clientID: clientID
         )
         return (key, cdnURL)
     }
@@ -100,7 +118,8 @@ enum SpotifyAPIResolver {
         trackURI: String,
         bearerToken: String,
         baseURL: String,
-        clientToken: String? = nil
+        clientToken: String? = nil,
+        clientID: String? = nil
     ) async throws -> [String] {
         let url = URL(string: "\(baseURL)/extended-metadata/v0/extended-metadata")!
         let body = ExtendedMetadataParser.buildTrackRequest(trackURI: trackURI)
@@ -109,6 +128,7 @@ enum SpotifyAPIResolver {
             method: "POST",
             bearerToken: bearerToken,
             clientToken: clientToken,
+            clientID: clientID,
             body: body,
             contentType: "application/protobuf",
             endpointLabel: "extended-metadata"
@@ -127,7 +147,8 @@ enum SpotifyAPIResolver {
         fileId: String,
         bearerToken: String,
         baseURL: String,
-        clientToken: String? = nil
+        clientToken: String? = nil,
+        clientID: String? = nil
     ) async throws -> Data {
         let url = URL(string: "\(baseURL)/playplay/v1/key/\(fileId)")!
         let data = try await requestData(
@@ -135,6 +156,7 @@ enum SpotifyAPIResolver {
             method: "POST",
             bearerToken: bearerToken,
             clientToken: clientToken,
+            clientID: clientID,
             body: Data(playplayRequestBody),
             contentType: "application/x-www-form-urlencoded",
             endpointLabel: "playplay"
@@ -152,7 +174,8 @@ enum SpotifyAPIResolver {
         fileId: String,
         bearerToken: String,
         baseURL: String,
-        clientToken: String? = nil
+        clientToken: String? = nil,
+        clientID: String? = nil
     ) async throws -> URL {
         let url = URL(
             string: "\(baseURL)/storage-resolve/v2/files/audio/interactive/0/\(fileId)?product=0"
@@ -162,6 +185,7 @@ enum SpotifyAPIResolver {
             method: "GET",
             bearerToken: bearerToken,
             clientToken: clientToken,
+            clientID: clientID,
             endpointLabel: "storage-resolve"
         )
 
@@ -183,6 +207,7 @@ enum SpotifyAPIResolver {
         method: String,
         bearerToken: String,
         clientToken: String?,
+        clientID: String?,
         body: Data? = nil,
         contentType: String? = nil,
         endpointLabel: String
@@ -193,6 +218,17 @@ enum SpotifyAPIResolver {
         if let clientToken = clientToken, !clientToken.isEmpty {
             request.setValue(clientToken, forHTTPHeaderField: "client-token")
         }
+        // Fidelity with the app's own requests: the playplay service binds the
+        // client-token to the client id and rejected our replay (HTTP 400)
+        // without these headers. `x-client-id` prefers the live-captured value.
+        request.setValue(
+            clientID?.isEmpty == false ? clientID : defaultClientID,
+            forHTTPHeaderField: "x-client-id"
+        )
+        request.setValue(appVersion, forHTTPHeaderField: "spotify-app-version")
+        request.setValue("iOS", forHTTPHeaderField: "app-platform")
+        request.setValue("*/*", forHTTPHeaderField: "Accept")
+        request.setValue(appUserAgent, forHTTPHeaderField: "User-Agent")
         if let body = body {
             request.httpBody = body
         }

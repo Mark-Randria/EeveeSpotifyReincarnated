@@ -20,6 +20,10 @@ final class DownloadManager {
 
     static let shared = DownloadManager()
     static let stateDidChangeNotification = Notification.Name("EeveeDownloadManagerStateDidChange")
+    /// Posted when the currently-playing track changes (fed by the lyrics
+    /// capture in CustomLyrics.x.swift). Lets the Downloads UI clear stale
+    /// terminal state (.failed/.finished) that belongs to the previous track.
+    static let trackDidChangeNotification = Notification.Name("EeveeDownloadTrackDidChange")
 
     private static let storageKey = "eevee.downloadedFiles"
     private static let downloadsSubdirectory = "EeveeSpotifyDownloads"
@@ -79,6 +83,21 @@ final class DownloadManager {
             self.lock.unlock()
             self.persist()
         }
+    }
+
+    /// Clears a stale terminal state (`.failed` / `.finished`) so the UI can
+    /// start a fresh download for the now-different current track. An in-flight
+    /// (`.downloading`) download is never touched. Called from the main thread
+    /// when the playing track changes.
+    func resetToIdleIfFinished() {
+        lock.lock()
+        switch _state {
+        case .failed, .finished:
+            _state = .idle
+        case .idle, .downloading:
+            break
+        }
+        lock.unlock()
     }
 
     /// Inserts a finished download at the top of the list (replacing any entry
@@ -169,7 +188,8 @@ final class DownloadManager {
                             trackURI: trackURI,
                             bearerToken: token,
                             baseURL: capture.spClientBaseURL,
-                            clientToken: capture.clientToken
+                            clientToken: capture.clientToken,
+                            clientID: capture.clientID
                         )
                         DownloadLogger.shared.log(
                             "download attempt: fileIds=\(fileIDs.joined(separator: ","))"
@@ -191,7 +211,8 @@ final class DownloadManager {
                             fileId: fileId,
                             bearerToken: token,
                             baseURL: capture.spClientBaseURL,
-                            clientToken: capture.clientToken
+                            clientToken: capture.clientToken,
+                            clientID: capture.clientID
                         )
                         stream = AudioStreamCapture.AudioStream(
                             trackGID: trackID,
