@@ -8,10 +8,11 @@ import Foundation
 ///
 /// The response bodies are parsed with `AudioKeyExtractor` (playplay) and
 /// `StorageResolveParser` (storage-resolve). This is the fallback when the
-/// passive capture never observed a complete key+URL pair — e.g. the C++ core's
-/// playplay / storage-resolve requests bypass the SPTDataLoaderService /
-/// HttpClientURLSession delegates (their response bodies never reach our hooks),
-/// even though the global `NSURLSessionTask.resume` hook still learns the fileId.
+/// passive capture never observed a complete key+URL pair — on 9.1.70 the C++
+/// core's playplay / storage-resolve requests bypass EVERY hooked layer
+/// (SPTDataLoaderService / HttpClientURLSession delegates and the global
+/// `NSURLSessionTask.resume` hook), so even the fileId must be re-resolved
+/// actively via the extended-metadata endpoint (see `fetchFileIDs`).
 ///
 /// The requests carry the app's own `Authorization: Bearer` token, so they are
 /// indistinguishable from the app's own traffic.
@@ -22,6 +23,7 @@ enum SpotifyAPIResolver {
         case httpStatus(Int, String)
         case emptyKeyResponse
         case emptyResolveResponse
+        case emptyMetadataResponse
 
         var errorDescription: String? {
             switch self {
@@ -35,9 +37,35 @@ enum SpotifyAPIResolver {
                 return "playplay key response contained no 16-byte key"
             case .emptyResolveResponse:
                 return "storage-resolve response contained no CDN url"
+            case .emptyMetadataResponse:
+                return "extended-metadata response contained no audio file id for this track"
             }
         }
     }
+
+    /// The playplay key request body, captured VERBATIM from the 9.1.70 HAR
+    /// (logs.md, interactive request #484):
+    ///
+    ///   08 05                       version = 5
+    ///   12 10 {16 bytes}            field 2 = the per-version hardcoded token
+    ///   20 01                       interactivity = 1 (interactive)
+    ///   28 01                       content type = 1 (audio track)
+    ///   30 8B A3 00 00 06           timestamp (monotonic client clock)
+    ///
+    /// The 16-byte token `020d341b4180645c7f4b1775807a8020` is a per-version
+    /// constant — every playplay request in the HAR carries the identical bytes
+    /// (requests #484/#493/#496). It is NOT the session client-token header.
+    /// If a future Spotify build rejects this body (HTTP 4xx), re-capture the
+    /// current token from a fresh HAR and update it here.
+    private static let playplayRequestBody: [UInt8] = [
+        0x08, 0x05,
+        0x12, 0x10,
+        0x02, 0x0D, 0x34, 0x1B, 0x41, 0x80, 0x64, 0x5C,
+        0x7F, 0x4B, 0x17, 0x75, 0x80, 0x7A, 0x80, 0x20,
+        0x20, 0x01,
+        0x28, 0x01,
+        0x30, 0x8B, 0xA3, 0x00, 0x00, 0x06,
+    ]
 
     /// Fetches the AES key and the CDN URL for a fileId. Returns (key, cdnURL).
     static func resolveAudioStream(
@@ -61,6 +89,38 @@ enum SpotifyAPIResolver {
         return (key, cdnURL)
     }
 
+    // MARK: - extended-metadata (track → fileId)
+
+    /// Resolves the 40-hex audio file id(s) for a track by replaying the
+    /// app's own TRACK_V4 extended-metadata request. Returns the ids in
+    /// response order (the account-default file is expected first).
+    ///
+    /// `trackURI` must be a full URI like `spotify:track:XXXX`.
+    static func fetchFileIDs(
+        trackURI: String,
+        bearerToken: String,
+        baseURL: String,
+        clientToken: String? = nil
+    ) async throws -> [String] {
+        let url = URL(string: "\(baseURL)/extended-metadata/v0/extended-metadata")!
+        let body = ExtendedMetadataParser.buildTrackRequest(trackURI: trackURI)
+        let data = try await requestData(
+            url: url,
+            method: "POST",
+            bearerToken: bearerToken,
+            clientToken: clientToken,
+            body: body,
+            contentType: "application/protobuf",
+            endpointLabel: "extended-metadata"
+        )
+
+        let fileIDs = ExtendedMetadataParser.extractFileIDs(from: data, trackURI: trackURI)
+        guard !fileIDs.isEmpty else {
+            throw ResolveError.emptyMetadataResponse
+        }
+        return fileIDs
+    }
+
     // MARK: - playplay key
 
     static func fetchAudioKey(
@@ -75,6 +135,8 @@ enum SpotifyAPIResolver {
             method: "POST",
             bearerToken: bearerToken,
             clientToken: clientToken,
+            body: Data(playplayRequestBody),
+            contentType: "application/x-www-form-urlencoded",
             endpointLabel: "playplay"
         )
 
@@ -121,6 +183,8 @@ enum SpotifyAPIResolver {
         method: String,
         bearerToken: String,
         clientToken: String?,
+        body: Data? = nil,
+        contentType: String? = nil,
         endpointLabel: String
     ) async throws -> Data {
         var request = URLRequest(url: url)
@@ -129,7 +193,12 @@ enum SpotifyAPIResolver {
         if let clientToken = clientToken, !clientToken.isEmpty {
             request.setValue(clientToken, forHTTPHeaderField: "client-token")
         }
-        request.setValue("application/x-protobuf", forHTTPHeaderField: "Content-Type")
+        if let body = body {
+            request.httpBody = body
+        }
+        if let contentType = contentType {
+            request.setValue(contentType, forHTTPHeaderField: "Content-Type")
+        }
         request.timeoutInterval = 30
 
         return try await withCheckedThrowingContinuation { continuation in

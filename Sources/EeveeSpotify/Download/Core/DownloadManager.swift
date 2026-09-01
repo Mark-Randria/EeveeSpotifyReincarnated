@@ -30,6 +30,11 @@ final class DownloadManager {
     private let userDefaults = UserDefaults.standard
     private let cdnClient = SpotifyCDNClient.shared
 
+    /// Last error from the active (playplay/storage-resolve) resolution, so the
+    /// terminal failure message reports the real cause instead of the generic
+    /// "play it first" hint.
+    private var lastActiveResolveError: Error?
+
     private var _state: DownloadState = .idle
     private var _downloadedFiles: [DownloadedFile] = []
 
@@ -108,6 +113,7 @@ final class DownloadManager {
         defer { AudioStreamCapture.shared.isCapturing = false }
 
         setState(.downloading(0))
+        lastActiveResolveError = nil
 
         do {
             let hasToken = AudioStreamCapture.shared.bearerToken != nil
@@ -135,17 +141,50 @@ final class DownloadManager {
                 )
             }
 
-            // 2) Fall back to actively re-resolving key + CDN URL for the
-            //    track's 40-hex fileId with the captured bearer token. This
-            //    covers the case where the C++ core's playplay/storage-resolve
-            //    responses never reached the delegate hooks (only the fileId is
-            //    observable, via the global NSURLSessionTask resume hook).
+            // 2) Actively re-resolve key + CDN URL with the captured bearer
+            //    token. On 9.1.70 the C++ core's playplay / storage-resolve
+            //    traffic is invisible to every hooked layer (delegates + the
+            //    global NSURLSessionTask.resume hook), so usually even the
+            //    fileId is unknown — resolve it from the track metadata via the
+            //    extended-metadata endpoint, then iterate the fileIds calling
+            //    playplay + storage-resolve ourselves.
             if stream == nil, let token = AudioStreamCapture.shared.bearerToken {
                 let capture = AudioStreamCapture.shared
-                let fileId = capture.fileID(forTrackGID: track.identifier)
-                    ?? capture.fileID(forTrackGID: track.identifier.split(separator: ":").last.map(String.init) ?? "")
+                let trackID = track.identifier
+                let rawID = trackID.split(separator: ":").last.map(String.init) ?? trackID
+                let trackURI = trackID.hasPrefix("spotify:") ? trackID : "spotify:track:\(rawID)"
 
-                if let fileId = fileId {
+                // fileIds known passively (rare on 9.1.70) come first; otherwise
+                // resolve them actively from the track metadata.
+                var fileIDs: [String] = []
+                if let captured = capture.fileID(forTrackGID: rawID)
+                    ?? capture.fileID(forTrackGID: trackID) {
+                    fileIDs.append(captured)
+                }
+
+                if fileIDs.isEmpty {
+                    DownloadLogger.shared.log("download attempt: resolving fileIds for \(trackURI)")
+                    do {
+                        fileIDs = try await SpotifyAPIResolver.fetchFileIDs(
+                            trackURI: trackURI,
+                            bearerToken: token,
+                            baseURL: capture.spClientBaseURL,
+                            clientToken: capture.clientToken
+                        )
+                        DownloadLogger.shared.log(
+                            "download attempt: fileIds=\(fileIDs.joined(separator: ","))"
+                        )
+                    } catch let metadataError {
+                        DownloadLogger.shared.log(
+                            "download attempt: fileId resolve failed: \(metadataError.localizedDescription)"
+                        )
+                        lastActiveResolveError = metadataError
+                    }
+                } else {
+                    DownloadLogger.shared.log("download attempt: fileId (captured)=\(fileIDs[0])")
+                }
+
+                for fileId in fileIDs {
                     DownloadLogger.shared.log("download attempt: active resolve fileId=\(fileId)")
                     do {
                         let (key, cdnURL) = try await SpotifyAPIResolver.resolveAudioStream(
@@ -155,28 +194,34 @@ final class DownloadManager {
                             clientToken: capture.clientToken
                         )
                         stream = AudioStreamCapture.AudioStream(
-                            trackGID: track.identifier,
+                            trackGID: trackID,
                             key: key,
                             url: cdnURL
                         )
                         DownloadLogger.shared.log(
                             "download attempt: active resolve ok key=\(key.count)B cdn=\(cdnURL.absoluteString)"
                         )
+                        break
                     } catch let resolveError {
                         DownloadLogger.shared.log(
-                            "download attempt: active resolve failed: \(resolveError.localizedDescription)"
+                            "download attempt: active resolve failed for \(fileId): \(DownloadManager.describe(resolveError))"
                         )
-                        setState(.failed("Could not resolve audio stream: \(DownloadManager.describe(resolveError))"))
-                        return
+                        lastActiveResolveError = resolveError
+                        stream = nil
                     }
                 }
             }
 
             guard let stream = stream else {
+                let lastError = lastActiveResolveError
                 DownloadLogger.shared.log(
                     "download attempt: no stream info for \(track.identifier), latest=\(AudioStreamCapture.shared.latestStream?.trackGID ?? "nil")"
                 )
-                setState(.failed("No audio stream captured for this track yet — play it first"))
+                if let lastError = lastError {
+                    setState(.failed("Could not resolve audio stream: \(DownloadManager.describe(lastError))"))
+                } else {
+                    setState(.failed("No audio stream captured for this track yet — play it first"))
+                }
                 return
             }
 

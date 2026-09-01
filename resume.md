@@ -295,3 +295,62 @@ section actually download a playable file for the current track on **9.1.70**.
   The capture logs key hex + response size; if decryption fails with a valid
   container check, the key is obfuscated and needs the per-version deobfuscation
   (SpotiLoad-style hook) — that is the next iteration if passive+active both fail.
+
+---
+
+## §12 feat/download-impl — 9.1.70: passive capture is dead, full active resolution (2026-09-01, round 2)
+
+### On-device verdict (user log + fresh Proxyman HAR, 2026-09-01)
+The playplay key exchange + storage-resolve DID happen in the app's traffic (HAR
+#483/#484: `GET /storage-resolve/v2/files/audio/interactive/0/0ddfc8…56f?product=0`
+→ 200 protobuf with cdnurls; `POST /playplay/v1/key/0ddfc8…56f` → 200, 24 bytes
+`0A 10 <16-byte key> 12 04 …`), but the tweak observed NONE of it:
+- No `[NET] Auth request` lines for playplay/storage-resolve → the C++ core's
+  audio-path HTTP does NOT go through NSURLSession (raw/CFNetwork stack).
+  `URLSessionTaskResumeHook` and both delegate hooks never see it → no fileId,
+  no key, no CDN URL ever captured.
+- `audio key exchange completed: partner-userid/encrypted/*` lines are FALSE
+  POSITIVES: the legacy `crypt` substring matcher matches "encrypted". Removed.
+- Download failed at "no stream info … latest=nil" because even the fileId is
+  unknown → the old active fallback (needs a captured fileId) never ran.
+
+### What the HAR proved (protocol for the ACTIVE path)
+- Key request body (30 bytes, verbatim, every request identical token):
+  `08 05 | 12 10 <020d341b4180645c7f4b1775807a8020> | 20 01 | 28 01 | 30 8B A3 00 00 06`
+  → field 2 = the PER-VERSION hardcoded 16-byte token (NOT the client-token
+  header). Captured verbatim into `SpotifyAPIResolver.playplayRequestBody`.
+- Key response = raw `AudioKeyResponse` protobuf: field 1 (0x0A, len 16) = key.
+  `AudioKeyExtractor` already parses this.
+- storage-resolve = `StorageResolveResponse`; `StorageResolveParser` already
+  parses this.
+- Track → fileId: `POST /extended-metadata/v0/extended-metadata` with extension
+  kind TRACK_V4 (10) embeds `type.googleapis.com/spotify.metadata.Track`
+  protobuf with `repeated AudioFile file = 12`, `AudioFile.file_id = 1`
+  (20 bytes → 40-hex). This endpoint DOES flow through the app normally and is
+  replayed by us with the captured bearer. Wrapper schema validated against HAR
+  #469 + librespot `extended_metadata.proto` / cspot `metadata.proto`.
+
+### Changes
+- `Download/Capture/ExtendedMetadataParser.swift` (NEW) — builds the
+  `BatchedEntityRequest{TRACK_V4}` protobuf + walks the response to extract the
+  track's 40-hex fileIds. Schema-tolerant length-delimited walker, never throws.
+- `Download/Core/SpotifyAPIResolver.swift` — `fetchFileIDs(trackURI:)` replays
+  extended-metadata; `fetchAudioKey` now sends the verbatim 9.1.70 playplay body
+  (`application/x-www-form-urlencoded`, per-version token). New
+  `.emptyMetadataResponse` error.
+- `Download/Core/DownloadManager.swift` — active path now: normalize track URI →
+  fileIds from capture OR extended-metadata → iterate fileIds calling
+  playplay+storage-resolve until one yields key+CDN URL (handles free-account
+  server-side downgrades: higher-bitrate fileIds may come back RESTRICTED).
+  Terminal failure reports the real resolve error instead of "play it first".
+- `Shared/Models/Extensions/URL+Extension.swift` — removed `crypt` from
+  `isAudioKeyExchangeURL` (partner-userid/encrypted false positives).
+
+### Next verification on device
+1. Logs must show `fileIds=…` (extended-metadata resolved) then
+   `active resolve ok key=16B cdn=…`.
+2. If CDN download reports `Decrypt failed — key extraction may be wrong`, the
+   playplay KEY endpoint is obfuscated after all → next step is reversing the
+   9.1.70 key deobfuscation (SpotiLoad-style) using the token.
+3. If `extended-metadata` returns no Track file (`.emptyMetadataResponse`),
+   dump the response fields and re-check the TRACK_V4 wrapper walk.

@@ -185,10 +185,13 @@ extension URL {
         if path.contains("playplay") {
             return true
         }
+        // NOTE: no `crypt` substring matcher here. On 9.1.70 it matched
+        // `partner-userid/encrypted/*` (the path contains "encrypted"), which
+        // is NOT a key exchange — the on-device log showed those as bogus
+        // "audio key exchange completed" events with 54B/108B buffers.
         return path.contains("track-urn")
             || path.contains("audio-key")
             || path.contains("key-exchange")
-            || path.contains("crypt")
             || path.contains("widevine")
     }
 
