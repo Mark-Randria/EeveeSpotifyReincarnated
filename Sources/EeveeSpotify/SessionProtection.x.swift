@@ -322,6 +322,14 @@ class URLSessionTaskResumeHook: ClassHook<NSObject> {
            let url = task.currentRequest?.url ?? task.originalRequest?.url,
            let host = url.host?.lowercased() {
 
+            // [EeveeDownload spike] Pure observation of audio-file requests
+            // (playplay key exchange + storage-resolve). This hook sees EVERY
+            // URLSession task in the app — including the C++ core's requests
+            // that may bypass the SPTDataLoaderService / HttpClientURLSession
+            // delegates — so it is the reliable place to learn the 40-hex
+            // fileId for the current track. Never alters control flow.
+            AudioStreamCapture.shared.observeRequestURL(url)
+
             let elapsed = Date().timeIntervalSince(tweakInitTime)
             let elapsedInt = Int(elapsed)
             let path = url.path

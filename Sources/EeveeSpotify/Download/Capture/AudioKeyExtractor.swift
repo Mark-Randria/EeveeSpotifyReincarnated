@@ -1,30 +1,89 @@
 import Foundation
 
-/// Heuristic extractor for the Spotify per-track AES audio key.
+/// Extracts the 16-byte per-track AES audio key from the playplay key
+/// exchange response.
 ///
-/// SPIKE: the audio-key exchange endpoint responds with an (at the time of
-/// writing) unknown protobuf schema. Instead of parsing it we scan the raw
-/// response bytes for a plausible protobuf length-delimited field: a varint
-/// that decodes to exactly `16` immediately followed by 16 bytes that are all
-/// non-zero. The first such candidate is assumed to be the AES-128 key.
+/// The key endpoint on 9.1.70+ is `POST /playplay/v1/key/{fileId}` (see
+/// logs.md). The response is protobuf whose first length-delimited field
+/// carries the key. Historically the classic `AudioKeyResponse` is:
 ///
-/// NOTE: This is a heuristic. It may return a false positive or nil, and it is
-/// strictly best-effort. It must never crash and never throw — every failure
-/// path returns nil.
+///     message AudioKeyResponse {
+///         optional bytes audio_key = 1;   // 16 bytes
+///         optional bytes track_id = 2;
+///     }
 ///
-/// CRASH CONTEXT: the first version copied the whole chunk into `[UInt8](data)`
-/// on every call. Key-exchange chunks arrive on the hot per-chunk path, so the
-/// scan now reads `data` directly via its Int subscript (no full copy).
+/// Strategy (defensive, never throws):
+///   1. Proper protobuf walk: look for tag 0x0A (field 1, wire type 2)
+///      followed by varint length 16 and 16 all-non-zero bytes.
+///   2. Fallback: the original heuristic scan for ANY varint that decodes to
+///      16 immediately followed by 16 non-zero bytes (covers schemas where the
+///      key is not field 1).
+///
+/// NOTE: Some builds wrap the key in an `obfuscated_key` field that requires
+/// per-version deobfuscation (see librespot-java playplay reversing). If the
+/// extracted 16 bytes fail to decrypt, that is the likely cause — the raw
+/// response bytes are logged so the scheme can be confirmed on-device.
 enum AudioKeyExtractor {
+    /// A protobuf "field 1, wire type 2" tag byte.
+    private static let field1LengthDelimitedTag: UInt8 = 0x0A
+
     static func extractKey(from data: Data) -> Data? {
-        guard data.count >= 16 else {
-            return nil
+        guard data.count >= 16 else { return nil }
+
+        // 1) Canonical protobuf layout: 0x0A <varint 16> <16 key bytes>.
+        if let key = extractProtobufField1Key(from: data) {
+            return key
         }
 
-        var offset = 0
+        // 2) Generic heuristic scan (original spike behavior).
+        return extractHeuristicKey(from: data)
+    }
 
+    /// Walks the protobuf for tag 0x0A (field 1, wire type 2) with a
+    /// length-prefixed payload of exactly 16 non-zero bytes.
+    private static func extractProtobufField1Key(from data: Data) -> Data? {
+        var offset = 0
         while offset < data.count {
-            // Try to decode a varint length starting at `offset`.
+            guard data[offset] == field1LengthDelimitedTag else {
+                offset += 1
+                continue
+            }
+
+            // Decode the varint length after the tag.
+            var cursor = offset + 1
+            var length: UInt64 = 0
+            var shift: UInt64 = 0
+            var validVarint = false
+            while cursor < data.count && shift < 64 {
+                let byte = data[cursor]
+                length |= UInt64(byte & 0x7F) << shift
+                cursor += 1
+                if byte & 0x80 == 0 {
+                    validVarint = true
+                    break
+                }
+                shift += 7
+            }
+
+            guard validVarint, length == 16, cursor + 16 <= data.count else {
+                offset += 1
+                continue
+            }
+
+            let candidate = data.subdata(in: cursor ..< cursor + 16)
+            if !candidate.contains(0) {
+                return candidate
+            }
+            offset += 1
+        }
+        return nil
+    }
+
+    /// Original spike heuristic: any varint that decodes to 16 immediately
+    /// followed by 16 all-non-zero bytes.
+    private static func extractHeuristicKey(from data: Data) -> Data? {
+        var offset = 0
+        while offset < data.count {
             var value: UInt64 = 0
             var shift: UInt64 = 0
             var cursor = offset
@@ -33,24 +92,20 @@ enum AudioKeyExtractor {
                 let byte = data[cursor]
                 value |= UInt64(byte & 0x7F) << shift
                 cursor += 1
-
                 if byte & 0x80 == 0 {
-                    break // end of varint
+                    break
                 }
                 shift += 7
             }
 
-            // Look for a length == 16 followed by 16 all-non-zero bytes.
             if value == 16 && cursor + 16 <= data.count {
                 let candidate = data.subdata(in: cursor ..< cursor + 16)
                 if !candidate.contains(0) {
                     return candidate
                 }
             }
-
             offset += 1
         }
-
         return nil
     }
 }

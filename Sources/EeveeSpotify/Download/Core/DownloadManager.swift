@@ -126,7 +126,53 @@ final class DownloadManager {
 
             DownloadLogger.shared.log("download attempt: track=\(track.identifier)")
 
-            guard let stream = resolveStreamInfo(forTrackIdentifier: track.identifier) else {
+            // 1) Prefer a passively captured stream (key + url from the app's
+            //    own playplay/storage-resolve traffic).
+            var stream = resolveStreamInfo(forTrackIdentifier: track.identifier)
+            if let stream = stream {
+                DownloadLogger.shared.log(
+                    "download attempt: using captured stream gid=\(stream.trackGID) cdn=\(stream.url.absoluteString)"
+                )
+            }
+
+            // 2) Fall back to actively re-resolving key + CDN URL for the
+            //    track's 40-hex fileId with the captured bearer token. This
+            //    covers the case where the C++ core's playplay/storage-resolve
+            //    responses never reached the delegate hooks (only the fileId is
+            //    observable, via the global NSURLSessionTask resume hook).
+            if stream == nil, let token = AudioStreamCapture.shared.bearerToken {
+                let capture = AudioStreamCapture.shared
+                let fileId = capture.fileID(forTrackGID: track.identifier)
+                    ?? capture.fileID(forTrackGID: track.identifier.split(separator: ":").last.map(String.init) ?? "")
+
+                if let fileId = fileId {
+                    DownloadLogger.shared.log("download attempt: active resolve fileId=\(fileId)")
+                    do {
+                        let (key, cdnURL) = try await SpotifyAPIResolver.resolveAudioStream(
+                            fileId: fileId,
+                            bearerToken: token,
+                            baseURL: capture.spClientBaseURL,
+                            clientToken: capture.clientToken
+                        )
+                        stream = AudioStreamCapture.AudioStream(
+                            trackGID: track.identifier,
+                            key: key,
+                            url: cdnURL
+                        )
+                        DownloadLogger.shared.log(
+                            "download attempt: active resolve ok key=\(key.count)B cdn=\(cdnURL.absoluteString)"
+                        )
+                    } catch let resolveError {
+                        DownloadLogger.shared.log(
+                            "download attempt: active resolve failed: \(resolveError.localizedDescription)"
+                        )
+                        setState(.failed("Could not resolve audio stream: \(DownloadManager.describe(resolveError))"))
+                        return
+                    }
+                }
+            }
+
+            guard let stream = stream else {
                 DownloadLogger.shared.log(
                     "download attempt: no stream info for \(track.identifier), latest=\(AudioStreamCapture.shared.latestStream?.trackGID ?? "nil")"
                 )

@@ -178,11 +178,39 @@ extension URL {
 
     var isAudioKeyExchangeURL: Bool {
         let path = self.path
+        // 9.1.70+ (and librespot-era clients): the per-track AES key is fetched
+        // from the playplay key endpoint — `/playplay/v1/key/{fileId}` — NOT the
+        // old key-exchange paths below. Verified in the 9.1.70 HAR capture
+        // (logs.md): request #28/#38/#41 `POST /playplay/v1/key/{fileId}`.
+        if path.contains("playplay") {
+            return true
+        }
         return path.contains("track-urn")
             || path.contains("audio-key")
             || path.contains("key-exchange")
             || path.contains("crypt")
             || path.contains("widevine")
+    }
+
+    /// The storage-resolve endpoint resolves a fileId to its CDN location:
+    /// `GET /storage-resolve/v2/files/audio/interactive/0/{fileId}?product=0`.
+    /// The response is a protobuf `StorageResolveResponse` whose `cdnurl`
+    /// (field 2, repeated string) is the authoritative CDN URL for the file —
+    /// parsing this beats hoping to observe the C++ core's own CDN request.
+    var isStorageResolveURL: Bool {
+        self.path.contains("storage-resolve")
+    }
+
+    /// TRUE only for the FOREGROUND (currently-playing) storage-resolve
+    /// variant: `/storage-resolve/v2/files/audio/interactive/0/{fileId}`.
+    /// The `interactive_prefetch` variant (HAR requests #37/#39) resolves the
+    /// NEXT queued track while the current track still plays, so it must NOT be
+    /// used to map "current track → fileId" — that would pollute the mapping
+    /// with the upcoming track's fileId.
+    var isInteractiveAudioResolve: Bool {
+        guard self.isStorageResolveURL else { return false }
+        let path = self.path
+        return path.contains("/interactive/") && !path.contains("interactive_prefetch")
     }
 
     var isSpotifyAPIURL: Bool {

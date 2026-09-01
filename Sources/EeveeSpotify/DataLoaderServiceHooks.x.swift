@@ -35,7 +35,8 @@ class SPTDataLoaderServiceHook: ClassHook<NSObject>, SpotifySessionDelegate {
 
         // [EeveeDownload spike] Pure observation — marker for completed audio key exchanges.
         if error == nil, url.isAudioKeyExchangeURL {
-            DownloadLogger.shared.log("audio key exchange completed: \(url.absoluteString)")
+            let bufferSize = AudioStreamCapture.shared.bufferedResponseSize(for: url)
+            DownloadLogger.shared.log("audio key exchange completed: \(url.absoluteString) buffered=\(bufferSize)B")
         }
 
         if CasitaResponseProbe.shouldProbe(url) {
@@ -203,6 +204,14 @@ class SPTDataLoaderServiceHook: ClassHook<NSObject>, SpotifySessionDelegate {
         // key-exchange responses are buffered for extraction.
         if url.isAudioKeyExchangeURL {
             AudioStreamCapture.shared.observeAudioResponse(url, data: data)
+        }
+
+        // storage-resolve responses carry the CDN URL in protobuf field 2
+        // (`cdnurl`) — parse them so the download pipeline knows the exact CDN
+        // location without depending on the C++ core's own stream request being
+        // observable through these delegates.
+        if url.isStorageResolveURL {
+            AudioStreamCapture.shared.observeStorageResolveResponse(url, data: data)
         }
 
         // Suppress original data for endpoints we'll replace in

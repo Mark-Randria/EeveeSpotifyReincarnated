@@ -203,7 +203,7 @@ struct EeveeDownloadsSettingsView: View {
                     .foregroundColor(Color(UIColor.systemGray2))
                 
                 Text(
-                    "P0: files are saved as audio files in the app's Documents folder. Playback requires a player that supports the file format (e.g. VLC)."
+                    "Files are saved as playable audio in the app's Documents folder. For the audio key + CDN URL to be captured, play the track first, then tap Download."
                 )
                 .font(.footnote)
                 .foregroundColor(.secondary)
