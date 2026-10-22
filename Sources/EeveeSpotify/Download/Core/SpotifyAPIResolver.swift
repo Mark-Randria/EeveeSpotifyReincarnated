@@ -12,7 +12,7 @@ import Foundation
 /// core's playplay / storage-resolve requests bypass EVERY hooked layer
 /// (SPTDataLoaderService / HttpClientURLSession delegates and the global
 /// `NSURLSessionTask.resume` hook), so even the fileId must be re-resolved
-/// actively via the extended-metadata endpoint (see `fetchFileIDs`).
+/// actively via the extended-metadata endpoint (see `fetchAudioFiles`).
 ///
 /// The requests carry the app's own `Authorization: Bearer` token, so they are
 /// indistinguishable from the app's own traffic.
@@ -107,20 +107,21 @@ enum SpotifyAPIResolver {
         return (key, cdnURL)
     }
 
-    // MARK: - extended-metadata (track → fileId)
+    // MARK: - extended-metadata (track → audio file candidates)
 
-    /// Resolves the 40-hex audio file id(s) for a track by replaying the
-    /// app's own TRACK_V4 extended-metadata request. Returns the ids in
-    /// response order (the account-default file is expected first).
+    /// Resolves the audio file candidates for a track by replaying the app's own
+    /// TRACK_V4 extended-metadata request. Each candidate carries the file id
+    /// and the `AudioFile.Format` enum, in response order (the account-default
+    /// file is expected first).
     ///
     /// `trackURI` must be a full URI like `spotify:track:XXXX`.
-    static func fetchFileIDs(
+    static func fetchAudioFiles(
         trackURI: String,
         bearerToken: String,
         baseURL: String,
         clientToken: String? = nil,
         clientID: String? = nil
-    ) async throws -> [String] {
+    ) async throws -> [SpotifyAudioFileCandidate] {
         let url = URL(string: "\(baseURL)/extended-metadata/v0/extended-metadata")!
         let body = ExtendedMetadataParser.buildTrackRequest(trackURI: trackURI)
         let data = try await requestData(
@@ -134,11 +135,32 @@ enum SpotifyAPIResolver {
             endpointLabel: "extended-metadata"
         )
 
-        let fileIDs = ExtendedMetadataParser.extractFileIDs(from: data, trackURI: trackURI)
-        guard !fileIDs.isEmpty else {
+        let candidates = ExtendedMetadataParser.extractAudioFiles(
+            from: data,
+            trackURI: trackURI
+        )
+        guard !candidates.isEmpty else {
             throw ResolveError.emptyMetadataResponse
         }
-        return fileIDs
+        return candidates
+    }
+
+    /// Id-only compatibility wrapper around `fetchAudioFiles`.
+    static func fetchFileIDs(
+        trackURI: String,
+        bearerToken: String,
+        baseURL: String,
+        clientToken: String? = nil,
+        clientID: String? = nil
+    ) async throws -> [String] {
+        let candidates = try await fetchAudioFiles(
+            trackURI: trackURI,
+            bearerToken: bearerToken,
+            baseURL: baseURL,
+            clientToken: clientToken,
+            clientID: clientID
+        )
+        return candidates.map { $0.fileID }
     }
 
     // MARK: - playplay key

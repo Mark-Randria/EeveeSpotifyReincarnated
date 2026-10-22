@@ -1,8 +1,131 @@
 import Foundation
 
+/// One `AudioFile` entry from a track's TRACK_V4 metadata: the 40-hex file id
+/// plus the `AudioFile.Format` enum value that says which container/codec the
+/// file uses.
+///
+/// `format` is optional because the proto field is optional and because a
+/// passively captured file id has no accompanying metadata. It is kept as a
+/// raw `UInt64` on purpose: a newer Spotify build can add enum values without
+/// breaking the parser, and the Phase 1 probe can log unknown values verbatim.
+struct SpotifyAudioFileCandidate {
+    let fileID: String
+    let format: UInt64?
+
+    init(fileID: String, format: UInt64? = nil) {
+        self.fileID = fileID
+        self.format = format
+    }
+
+    /// Human-readable `spotify.metadata.AudioFile.Format` name. Unknown values
+    /// stay visible as `UNKNOWN(n)` so the probe can reveal new formats without
+    /// a code change.
+    var formatName: String {
+        guard let format = format else { return "UNKNOWN" }
+        switch format {
+        case 0: return "OGG_VORBIS_96"
+        case 1: return "OGG_VORBIS_160"
+        case 2: return "OGG_VORBIS_320"
+        case 3: return "MP3_256"
+        case 4: return "MP3_320"
+        case 5: return "MP3_160"
+        case 6: return "MP3_96"
+        case 7: return "MP3_160_ENC"
+        case 8: return "AAC_24"
+        case 9: return "AAC_48"
+        case 10: return "MP4_128"
+        case 11: return "MP4_256"
+        case 12: return "MP4_128_DUAL"
+        case 13: return "MP4_256_DUAL"
+        case 14: return "MP4_128_CBCS"
+        case 15: return "MP4_256_CBCS"
+        case 16: return "FLAC_FLAC"
+        case 17: return "MP4_FLAC"
+        case 18: return "XHE_AAC_24"
+        case 19: return "XHE_AAC_16"
+        case 20: return "XHE_AAC_12"
+        case 21: return "HE_AAC_64"
+        case 22: return "FLAC_FLAC_24BIT"
+        case 23: return "MP4_FLAC_24BIT"
+        default: return "UNKNOWN(\(format))"
+        }
+    }
+
+    /// Best-effort container/codec hint from the metadata. This is NOT proof of
+    /// the decrypted bytes — `SpotifyCDNClient` verifies the actual container
+    /// from the magic bytes after download.
+    var containerHint: String {
+        guard let format = format else { return "unknown" }
+        switch format {
+        case 0, 1, 2: return "ogg"
+        case 3, 4, 5, 6, 7: return "mp3"
+        case 8, 9: return "aac"
+        case 10, 11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 23: return "mp4"
+        case 16, 22: return "flac"
+        default: return "unknown"
+        }
+    }
+
+    /// True when the metadata describes an MP4 container. These are the files
+    /// that iOS local-files playback can consume without a transcode, subject
+    /// to DRM/playplay compatibility (see `mayBeDRMProtected`).
+    var isMP4Container: Bool { containerHint == "mp4" }
+
+    /// MP4/EME and xHE-AAC entries are normally DRM-protected. The playplay AES
+    /// key may not decrypt them; the probe logs this so a failed resolve is
+    /// explained instead of mysterious.
+    var mayBeDRMProtected: Bool {
+        guard let format = format else { return false }
+        return (10...15).contains(format) || (18...20).contains(format)
+    }
+
+    /// Selection preference for the next phase. Higher is better.
+    ///
+    /// This is a **playability-aware** score, not a pure quality score: MP4
+    /// first (no transcode), then Ogg 320 (best lossy fallback), then the lower
+    /// Ogg/MP3 tiers. FLAC is lossless but is ranked below Ogg because its
+    /// container support in Local Files is unverified and it would need a
+    /// transcode. AAC_24/AAC_48 sit near the bottom: they are only 24/48 kbps
+    /// and are not an upgrade over Ogg 320.
+    ///
+    /// The rank deliberately says nothing about whether a format can actually
+    /// be decrypted; Phase 2 tries the ranked candidates in order and falls
+    /// back when playplay/storage-resolve or container validation fails.
+    var qualityRank: Int {
+        guard let format = format else { return 0 }
+        switch format {
+        case 11: return 100       // MP4_256
+        case 13, 15: return 98    // MP4_256_DUAL / MP4_256_CBCS
+        case 10: return 95        // MP4_128
+        case 12, 14: return 93    // MP4_128_DUAL / MP4_128_CBCS
+        case 2: return 90         // OGG_VORBIS_320
+        case 1: return 80         // OGG_VORBIS_160
+        case 0: return 70         // OGG_VORBIS_96
+        case 4: return 65         // MP3_320
+        case 3: return 60         // MP3_256
+        case 16, 22: return 55    // FLAC (lossless; needs transcode/verification)
+        case 5: return 50         // MP3_160
+        case 7: return 45         // MP3_160_ENC
+        case 6: return 40         // MP3_96
+        case 21: return 30        // HE_AAC_64
+        case 9: return 25         // AAC_48
+        case 8: return 20         // AAC_24
+        case 17, 18, 19, 20, 23: return 15 // MP4 FLAC / xHE-AAC
+        default: return 0
+        }
+    }
+
+    /// One-line probe representation, e.g.
+    /// `OGG_VORBIS_320(raw=2,hint=ogg,drm=false,rank=90):0123…`.
+    var probeDescription: String {
+        let raw = format.map { String($0) } ?? "nil"
+        return "\(formatName)(raw=\(raw),hint=\(containerHint),drm=\(mayBeDRMProtected),rank=\(qualityRank)):\(fileID)"
+    }
+}
+
 /// Builds the `extended-metadata/v0/extended-metadata` request the 9.1.70 app
 /// uses for per-track metadata, and parses the response to recover the 40-hex
-/// audio FILE id(s) for a track.
+/// audio FILE id(s) and their `AudioFile.Format` values for a track.
 ///
 /// WHY: the download pipeline needs the fileId to actively re-resolve the
 /// playplay AES key + storage-resolve CDN URL. On 9.1.70 the playplay /
@@ -75,11 +198,16 @@ enum ExtendedMetadataParser {
 
     // MARK: - Response
 
-    /// Extracts every 40-hex audio file id found for `trackURI` in a
-    /// `BatchedExtensionResponse`. Returns [] when the response is malformed or
-    /// the track's TRACK_V4 extension is absent.
-    static func extractFileIDs(from response: Data, trackURI: String) -> [String] {
-        var result: [String] = []
+    /// Extracts every audio file candidate found for `trackURI` in a
+    /// `BatchedExtensionResponse`, preserving response order and the
+    /// `AudioFile.format` enum. Returns [] when the response is malformed or the
+    /// track's TRACK_V4 extension is absent.
+    static func extractAudioFiles(
+        from response: Data,
+        trackURI: String
+    ) -> [SpotifyAudioFileCandidate] {
+        var result: [SpotifyAudioFileCandidate] = []
+        var seenFileIDs = Set<String>()
 
         // BatchedExtensionResponse.extended_metadata (field 2)
         for array in lengthDelimitedFields(response, tag: 0x12) {
@@ -101,14 +229,31 @@ enum ExtendedMetadataParser {
                 // Track.file (field 12, tag 0x62) = repeated AudioFile
                 for audioFile in lengthDelimitedFields(track, tag: 0x62) {
                     // AudioFile.file_id (field 1) = 20 bytes → 40-hex
-                    if let fileID = firstLengthDelimited(audioFile, tag: 0x0A),
-                       fileID.count == 20 {
-                        result.append(hex(fileID))
+                    guard let fileID = firstLengthDelimited(audioFile, tag: 0x0A),
+                          fileID.count == 20 else {
+                        continue
+                    }
+                    // AudioFile.format (field 2) = varint enum (optional)
+                    let format = varintField(audioFile, tag: 0x10)
+                    let candidate = SpotifyAudioFileCandidate(
+                        fileID: hex(fileID),
+                        format: format
+                    )
+                    // The same Track extension can appear more than once in a
+                    // batched response; keep the first occurrence so the probe
+                    // does not resolve/download the same file id twice.
+                    if seenFileIDs.insert(candidate.fileID).inserted {
+                        result.append(candidate)
                     }
                 }
             }
         }
         return result
+    }
+
+    /// Backwards-compatible id-only view of `extractAudioFiles`.
+    static func extractFileIDs(from response: Data, trackURI: String) -> [String] {
+        extractAudioFiles(from: response, trackURI: trackURI).map { $0.fileID }
     }
 
     // MARK: - Protobuf primitives
@@ -169,6 +314,23 @@ enum ExtendedMetadataParser {
     private static func stringField(_ data: Data, tag: UInt8) -> String? {
         guard let payload = firstLengthDelimited(data, tag: tag) else { return nil }
         return String(data: payload, encoding: .utf8)
+    }
+
+    /// Value of the first varint field with tag byte `tag` at this message
+    /// level. Used for enum fields such as `AudioFile.format` (field 2, tag
+    /// 0x10). Returns nil when the field is absent or malformed.
+    private static func varintField(_ data: Data, tag: UInt8) -> UInt64? {
+        var offset = 0
+        while offset < data.count {
+            guard data[offset] == tag else {
+                offset = skipField(data, at: offset)
+                continue
+            }
+            offset += 1
+            guard let (value, _) = readVarint(data, at: offset) else { return nil }
+            return value
+        }
+        return nil
     }
 
     /// Skips one field (any wire type) starting at `offset`, returning the next

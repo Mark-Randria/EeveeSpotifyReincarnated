@@ -28,6 +28,14 @@ final class DownloadManager {
     private static let storageKey = "eevee.downloadedFiles"
     private static let downloadsSubdirectory = "EeveeSpotifyDownloads"
 
+    /// Extensions the pipeline can publish. `reconcileDownloadsDirectory`
+    /// scans the same folder as `DownloadLogger`, so without this filter the
+    /// `eevee.log` file (and any interrupted `.tmp` staging file) would be
+    /// listed as a download.
+    private static let publishedAudioExtensions: Set<String> = [
+        "m4a", "mp4", "mp3", "flac", "ogg", "aac", "opus"
+    ]
+
     private let queue = DispatchQueue(label: "com.eevee.downloads", qos: .utility)
     private let lock = NSLock()
     private let fileManager = FileManager.default
@@ -158,6 +166,9 @@ final class DownloadManager {
                 DownloadLogger.shared.log(
                     "download attempt: using captured stream gid=\(stream.trackGID) cdn=\(stream.url.absoluteString)"
                 )
+                DownloadLogger.shared.log(
+                    "AUDIO-FORMAT-PROBE skipped: passive stream already captured; no metadata candidates requested"
+                )
             }
 
             // 2) Actively re-resolve key + CDN URL with the captured bearer
@@ -173,18 +184,21 @@ final class DownloadManager {
                 let rawID = trackID.split(separator: ":").last.map(String.init) ?? trackID
                 let trackURI = trackID.hasPrefix("spotify:") ? trackID : "spotify:track:\(rawID)"
 
-                // fileIds known passively (rare on 9.1.70) come first; otherwise
-                // resolve them actively from the track metadata.
-                var fileIDs: [String] = []
+                // Candidates known passively (rare on 9.1.70) come first;
+                // otherwise resolve them actively from the track metadata.
+                // Phase 1 intentionally keeps the existing "first resolvable
+                // file" selection so the probe does not change which bytes are
+                // downloaded — it only records what Spotify offered.
+                var candidates: [SpotifyAudioFileCandidate] = []
                 if let captured = capture.fileID(forTrackGID: rawID)
                     ?? capture.fileID(forTrackGID: trackID) {
-                    fileIDs.append(captured)
+                    candidates.append(SpotifyAudioFileCandidate(fileID: captured))
                 }
 
-                if fileIDs.isEmpty {
-                    DownloadLogger.shared.log("download attempt: resolving fileIds for \(trackURI)")
+                if candidates.isEmpty {
+                    DownloadLogger.shared.log("download attempt: resolving audio files for \(trackURI)")
                     do {
-                        fileIDs = try await SpotifyAPIResolver.fetchFileIDs(
+                        candidates = try await SpotifyAPIResolver.fetchAudioFiles(
                             trackURI: trackURI,
                             bearerToken: token,
                             baseURL: capture.spClientBaseURL,
@@ -192,20 +206,36 @@ final class DownloadManager {
                             clientID: capture.clientID
                         )
                         DownloadLogger.shared.log(
-                            "download attempt: fileIds=\(fileIDs.joined(separator: ","))"
+                            "AUDIO-FORMAT-PROBE track=\(trackURI) candidates=[\(candidates.map { $0.probeDescription }.joined(separator: " | "))]"
                         )
                     } catch let metadataError {
                         DownloadLogger.shared.log(
-                            "download attempt: fileId resolve failed: \(metadataError.localizedDescription)"
+                            "download attempt: audio file resolve failed: \(metadataError.localizedDescription)"
                         )
                         lastActiveResolveError = metadataError
                     }
                 } else {
-                    DownloadLogger.shared.log("download attempt: fileId (captured)=\(fileIDs[0])")
+                    DownloadLogger.shared.log(
+                        "AUDIO-FORMAT-PROBE track=\(trackURI) candidates=[captured:\(candidates[0].probeDescription)]"
+                    )
                 }
 
-                for fileId in fileIDs {
-                    DownloadLogger.shared.log("download attempt: active resolve fileId=\(fileId)")
+                // Resolve EVERY candidate for the probe, but keep the existing
+                // selection rule: the first candidate in response order that
+                // yields a key + CDN URL is the one downloaded. The extra
+                // playplay/storage-resolve calls tell us whether Spotify issues
+                // keys for MP4/AAC file ids at all, without downloading their
+                // bytes. Phase 2A can then rank the resolvable candidates.
+                var firstResolved: (
+                    candidate: SpotifyAudioFileCandidate,
+                    key: Data,
+                    url: URL
+                )?
+                for candidate in candidates {
+                    let fileId = candidate.fileID
+                    DownloadLogger.shared.log(
+                        "AUDIO-FORMAT-PROBE resolving fileId=\(fileId) format=\(candidate.formatName) hint=\(candidate.containerHint) drm=\(candidate.mayBeDRMProtected) rank=\(candidate.qualityRank)"
+                    )
                     do {
                         let (key, cdnURL) = try await SpotifyAPIResolver.resolveAudioStream(
                             fileId: fileId,
@@ -214,22 +244,36 @@ final class DownloadManager {
                             clientToken: capture.clientToken,
                             clientID: capture.clientID
                         )
-                        stream = AudioStreamCapture.AudioStream(
-                            trackGID: trackID,
-                            key: key,
-                            url: cdnURL
-                        )
+                        let cdnExtension = cdnURL.pathExtension.isEmpty
+                            ? "<none>"
+                            : cdnURL.pathExtension
                         DownloadLogger.shared.log(
-                            "download attempt: active resolve ok key=\(key.count)B cdn=\(cdnURL.absoluteString)"
+                            "AUDIO-FORMAT-PROBE resolvable fileId=\(fileId) format=\(candidate.formatName) key=\(key.count)B cdnExt=\(cdnExtension) cdnHost=\(cdnURL.host ?? "?")"
                         )
-                        break
+                        if firstResolved == nil {
+                            firstResolved = (
+                                candidate: candidate,
+                                key: key,
+                                url: cdnURL
+                            )
+                        }
                     } catch let resolveError {
                         DownloadLogger.shared.log(
-                            "download attempt: active resolve failed for \(fileId): \(DownloadManager.describe(resolveError))"
+                            "AUDIO-FORMAT-PROBE unavailable fileId=\(fileId) format=\(candidate.formatName) error=\(DownloadManager.describe(resolveError))"
                         )
                         lastActiveResolveError = resolveError
-                        stream = nil
                     }
+                }
+
+                if let resolved = firstResolved {
+                    DownloadLogger.shared.log(
+                        "AUDIO-FORMAT-PROBE selected fileId=\(resolved.candidate.fileID) format=\(resolved.candidate.formatName) hint=\(resolved.candidate.containerHint) rank=\(resolved.candidate.qualityRank)"
+                    )
+                    stream = AudioStreamCapture.AudioStream(
+                        trackGID: trackID,
+                        key: resolved.key,
+                        url: resolved.url
+                    )
                 }
             }
 
@@ -339,6 +383,10 @@ final class DownloadManager {
         return directory
     }
 
+    private static func isPublishedAudioFile(_ url: URL) -> Bool {
+        publishedAudioExtensions.contains(url.pathExtension.lowercased())
+    }
+
     private static func describe(_ error: Error) -> String {
         // The captured key may be a heuristic extraction (Lane A). A decrypt
         // failure is most likely a wrong key, so report it clearly.
@@ -382,10 +430,12 @@ final class DownloadManager {
             return
         }
 
-        // Drop persisted entries whose file no longer exists on disk.
+        // Drop persisted entries whose file no longer exists on disk, plus
+        // non-audio entries left behind by older builds (notably `eevee.log`).
         files = files.filter { file in
             let url = directory.appendingPathComponent(file.relativePath)
-            return fileManager.fileExists(atPath: url.path)
+            return DownloadManager.isPublishedAudioFile(url)
+                && fileManager.fileExists(atPath: url.path)
         }
 
         // Pick up files that exist on disk but were never recorded.
@@ -396,6 +446,7 @@ final class DownloadManager {
             options: []
         ) {
             for url in contents {
+                guard DownloadManager.isPublishedAudioFile(url) else { continue }
                 let relativePath = url.lastPathComponent
                 guard !recordedPaths.contains(relativePath) else { continue }
                 let attributes = try? fileManager.attributesOfItem(atPath: url.path)
