@@ -1,7 +1,7 @@
 # Advancement — In-App Offline Downloader via Spotify Local Files
 
-**Status:** Phase 1 probe implemented in source; build and on-device run pending
-**Date:** 2026-10-22
+**Status:** Phase 1 probe run on-device; playplay HTTP 400 root-caused and fixed in source; rebuild and retest pending
+**Date:** 2026-10-23
 **Branch:** `feat/download-impl`
 **Target:** Spotify `9.1.70` (`ipa_original/Spotify_9.1.70.ipa`)
 **Accepted UX:** the downloaded song appears under Spotify's **Local Files** and plays offline in the Spotify player. It does **not** replace the original Spotify track row.
@@ -184,17 +184,53 @@ P0 gaps found before Phase 1:
 - `POST /playplay/v1/key/{fileId}`
 - `GET /storage-resolve/v2/files/audio/interactive/0/{fileId}?product=0`
 
-### 5.2 playplay returned HTTP 400
+### 5.2 playplay returned HTTP 400 — root cause: malformed request body
 
-**Problem:** The replayed key request was rejected even with a byte-identical body.
+**Problem:** Every replay of `POST /playplay/v1/key/{fileId}` returned HTTP 400,
+including Ogg candidates that had resolved fine through `extended-metadata`.
 
-**Workaround:** The playplay service binds `client-token` to `x-client-id`. Add the app's identity headers:
+**Actual root cause (confirmed by diffing the app's 200 HAR against our 400 HAR):**
+the 30-byte `PlayPlayLicenseRequest` was transcribed incorrectly. The HAR text
+export replaces non-UTF-8 bytes with U+FFFD, and the earlier reconstruction
+dropped one byte:
 
-- `x-client-id` (live-captured; fallback constant)
-- `spotify-app-version: 9.1.70.1906`
-- `app-platform: iOS`
-- exact User-Agent
-- verbatim 30-byte playplay body with the per-version token
+- Correct 16-byte token:
+  `02 0D 34 1B 41 80 64 5C 80 7F 4B 17 75 80 7A 80`
+- Previous token:
+  `02 0D 34 1B 41 80 64 5C 7F 4B 17 75 80 7A 80 20`
+
+The old token was missing the `80` after `5C`, which shifted the last token
+byte and consumed the following `0x20` field-4 tag as part of the token. The
+timestamp was also wrong:
+
+- Correct field 6: `30 80 80 80 80 06` → valid varint `1610612736`
+- Previous field 6: `30 8B A3 00 00 06` → invalid protobuf; the varint ends at
+  `00`, leaving two trailing bytes, so the server parses the body as malformed
+  and returns 400.
+
+The app's own 200 request and our 400 request had the same URL shape, method,
+`Content-Type`, `client-token` header, and 30-byte `Content-Length`; the
+difference was the body bytes. This explains why header changes
+(`x-client-id`, `spotify-app-version`, custom User-Agent) did not fix the 400.
+
+**Fix:** `SpotifyAPIResolver.playplayRequestBody` now contains the corrected,
+valid 30-byte body:
+
+```text
+08 05
+12 10 02 0D 34 1B 41 80 64 5C 80 7F 4B 17 75 80 7A 80
+20 01
+28 01
+30 80 80 80 80 06
+```
+
+The app identity headers remain for fidelity but are not the cause of the
+earlier 400. The app's own playplay request does not include `x-client-id`.
+
+**Lesson:** when copying binary protobuf from a HAR, decode the exported body
+from raw bytes. A text export that shows `�` (U+FFFD) has already destroyed
+the original bytes. Validate the reconstructed body with a protobuf parser and
+confirm `bodySize == serialized length == Content-Length` before shipping.
 
 ### 5.3 Only file ids were available
 
@@ -307,19 +343,19 @@ The probe's selected download is still the first resolvable candidate. It may be
 
 On 9.1.70 passive capture is rare. If the log shows `AUDIO-FORMAT-PROBE skipped` or `candidates=[captured:UNKNOWN ...]`, the probe did not query TRACK_V4 metadata; try a different track or restart the app so the active resolver path runs.
 
-### 7.1 Probe results (fill in after M2)
+### 7.1 Probe results (on-device, 9.1.70, 2026-10-22)
 
 | Field | Value |
 |---|---|
-| Track URI | _pending_ |
-| Candidate formats (in order) | _pending_ |
-| MP4 resolvable? | _pending_ |
-| Selected format | _pending_ |
-| Decrypted container | _pending_ |
-| MP4 brand / DRM markers | _pending_ |
-| Ogg codec | _pending_ |
-| Playback result offline | _pending_ |
-| Notes | _pending_ |
+| Track URI | `spotify:track:6mIiV28R5NjFBuSo31u2ER` (also `spotify:track:4ODMW1oOz3yppcetVmb0By`) |
+| Candidate formats (in order) | `OGG_VORBIS_320` (`9ba22f13…`), `OGG_VORBIS_160` (`b4ef7fd1…`), `OGG_VORBIS_96` (`26f66575…`), `AAC_24` (`2a0439b4…`) |
+| MP4 resolvable? | No MP4 candidates offered for either tested track |
+| Selected format | None — every candidate failed at playplay |
+| Decrypted container | — |
+| MP4 brand / DRM markers | — |
+| Ogg codec | — |
+| Playback result offline | — |
+| Notes | All four candidates returned `playplay responded with HTTP 400`; second track identical. Root cause was the malformed request body in §5.2, now fixed. `storage-resolve` for the app's own playback was observed, confirming the session/token path is live. |
 
 ---
 
@@ -344,8 +380,8 @@ On 9.1.70 passive capture is rare. If the log shows `AUDIO-FORMAT-PROBE skipped`
 |---|---|---|
 | **M0 — Research and route selection** | Done | Native offline ruled out; Local Files accepted; OnTheSpot protocol mapped |
 | **M1 — Phase 1 probe code** | Done in source | Parser exposes formats; resolver exposes candidates; downloader logs candidates and container; no selection change |
-| **M2 — On-device probe** | Pending | One track logs a complete `AUDIO-FORMAT-PROBE` candidate list; MP4 resolvability known |
-| **M3 — Direct MP4 path** | Pending (gated on M2) | If MP4 resolves and is playable: rank MP4 first, output `.m4a`, verify offline playback |
+| **M2 — On-device probe** | In progress | Candidate list captured; playplay 400 root-caused and fixed; rebuild/retest to get a resolvable candidate |
+| **M3 — Direct MP4 path** | Pending (gated on M2) | If MP4 resolves and is playable: rank MP4 first, output `.m4a`, verify offline playback. M2 showed no MP4 candidates, so M4 is the likely path |
 | **M4 — Ogg → AAC/M4A transcode** | Pending | If MP4 is unavailable/DRM: Ogg 320 decodes and encodes to `.m4a`; duration/seek correct |
 | **M5 — Local Files verification** | Pending | Track appears under Local Files and plays in airplane mode after relaunch |
 | **M6 — Polish and app-only hardening** | Pending | Metadata/artwork, retry/cancel, duplicate handling, file sharing disabled, storage cleanup |
@@ -411,3 +447,4 @@ If any condition fails, move to M4.
 |---|---|
 | 2026-10-22 | Created this document; captured route decision, findings, workarounds, Phase 1 implementation, and milestones |
 | 2026-10-22 | Phase 1 source changes: `AudioFile.format` parsing, candidate resolution logging, container sniffing, reconcile filter |
+| 2026-10-23 | On-device probe recorded: no MP4 offered; all playplay calls 400. Root-caused the 400 to a malformed `PlayPlayLicenseRequest` body (one dropped token byte + invalid timestamp varint). Corrected `SpotifyAPIResolver.playplayRequestBody`; retest pending. |

@@ -44,17 +44,14 @@ enum SpotifyAPIResolver {
     }
 
     /// The Spotify iOS client id (`x-client-id`), identical in both HAR
-    /// captures (logs.md). The playplay service validates the `client-token`
-    /// against it — replaying playplay without it returns HTTP 400. Preferred
-    /// value is the one captured live from the app's own requests
-    /// (`AudioStreamCapture.clientID`); this constant is the fallback.
+    /// captures (logs.md). It is not required on playplay (the app's own 200
+    /// request does not carry it), but it is kept for other spclient calls and
+    /// as a fallback identity header. Preferred value is the one captured live
+    /// from the app's own requests (`AudioStreamCapture.clientID`).
     static let defaultClientID = "58bd3c95768941ea9eb4350aaa033eb3"
 
     /// App identity headers the 9.1.70 app sends on playplay / storage-resolve
-    /// / extended-metadata requests (from the HAR capture). Fidelity matters:
-    /// the server rejected our earlier playplay replay with HTTP 400 while the
-    /// app's own byte-identical-body request was accepted — the missing pieces
-    /// are these headers (above all `x-client-id`).
+    /// / extended-metadata requests (from the HAR capture).
     static let appVersion = "9.1.70.1906"
     static let appUserAgent = "Spotify/9.1.70.1906 iOS/Version 16.1 (Build 20B82)"
 
@@ -65,21 +62,32 @@ enum SpotifyAPIResolver {
     ///   12 10 {16 bytes}            field 2 = the per-version hardcoded token
     ///   20 01                       interactivity = 1 (interactive)
     ///   28 01                       content type = 1 (audio track)
-    ///   30 8B A3 00 00 06           timestamp (monotonic client clock)
+    ///   30 80 80 80 80 06           timestamp = 1610612736 (2021-01-14)
     ///
-    /// The 16-byte token `020d341b4180645c7f4b1775807a8020` is a per-version
+    /// The 16-byte token `020d341b4180645c807f4b1775807a80` is a per-version
     /// constant — every playplay request in the HAR carries the identical bytes
     /// (requests #484/#493/#496). It is NOT the session client-token header.
+    ///
+    /// IMPORTANT: a HAR exported as text replaces non-UTF-8 bytes with U+FFFD.
+    /// The previous constant was reconstructed from that lossy text and was
+    /// missing the `0x80` byte after `0x5C`, so it also consumed the `0x20`
+    /// field-4 tag as the last token byte. The timestamp was copied as
+    /// `8B A3 00 00 06`, which is not a valid protobuf varint (it terminates
+    /// after `00` and leaves two trailing bytes). The server rejected every
+    /// such request with HTTP 400. The correct body below is 30 bytes, valid
+    /// protobuf, and matches the app's own 200 request body.
+    ///
     /// If a future Spotify build rejects this body (HTTP 4xx), re-capture the
-    /// current token from a fresh HAR and update it here.
+    /// body from a fresh HAR and decode it from the raw bytes (not the text
+    /// rendering) before updating it here.
     private static let playplayRequestBody: [UInt8] = [
         0x08, 0x05,
         0x12, 0x10,
         0x02, 0x0D, 0x34, 0x1B, 0x41, 0x80, 0x64, 0x5C,
-        0x7F, 0x4B, 0x17, 0x75, 0x80, 0x7A, 0x80, 0x20,
+        0x80, 0x7F, 0x4B, 0x17, 0x75, 0x80, 0x7A, 0x80,
         0x20, 0x01,
         0x28, 0x01,
-        0x30, 0x8B, 0xA3, 0x00, 0x00, 0x06,
+        0x30, 0x80, 0x80, 0x80, 0x80, 0x06,
     ]
 
     /// Fetches the AES key and the CDN URL for a fileId. Returns (key, cdnURL).
@@ -240,9 +248,9 @@ enum SpotifyAPIResolver {
         if let clientToken = clientToken, !clientToken.isEmpty {
             request.setValue(clientToken, forHTTPHeaderField: "client-token")
         }
-        // Fidelity with the app's own requests: the playplay service binds the
-        // client-token to the client id and rejected our replay (HTTP 400)
-        // without these headers. `x-client-id` prefers the live-captured value.
+        // App identity headers. `x-client-id` prefers the live-captured value.
+        // (The earlier HTTP 400 was caused by a malformed playplay body, not by
+        // a missing header; see `playplayRequestBody`.)
         request.setValue(
             clientID?.isEmpty == false ? clientID : defaultClientID,
             forHTTPHeaderField: "x-client-id"
