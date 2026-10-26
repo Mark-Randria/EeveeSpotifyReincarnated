@@ -178,7 +178,7 @@ final class DownloadManager {
                     "download attempt: using captured stream gid=\(stream.trackGID) cdn=\(stream.url.absoluteString)"
                 )
                 DownloadLogger.shared.log(
-                    "AUDIO-FORMAT-PROBE skipped: passive stream already captured; no metadata candidates requested"
+                    "AUDIO-FORMAT-PROBE captured stream preferred; resolving metadata candidates as fallback"
                 )
             }
 
@@ -189,7 +189,7 @@ final class DownloadManager {
             //    fileId is unknown — resolve it from the track metadata via the
             //    extended-metadata endpoint, then iterate the fileIds calling
             //    playplay + storage-resolve ourselves.
-            if stream == nil, let token = AudioStreamCapture.shared.bearerToken {
+            if let token = AudioStreamCapture.shared.bearerToken {
                 let capture = AudioStreamCapture.shared
                 let trackID = track.identifier
                 let rawID = trackID.split(separator: ":").last.map(String.init) ?? trackID
@@ -280,7 +280,7 @@ final class DownloadManager {
                     }
                 }
 
-                if let resolved = resolvedStreams.first {
+                if stream == nil, let resolved = resolvedStreams.first {
                     DownloadLogger.shared.log(
                         "AUDIO-FORMAT-PROBE selected fileId=\(resolved.candidate.fileID) format=\(resolved.candidate.formatName) hint=\(resolved.candidate.containerHint) rank=\(resolved.candidate.qualityRank)"
                     )
@@ -357,9 +357,23 @@ final class DownloadManager {
                     break
                 }
                 catch let error as SpotifyCDNClient.CDNError {
-                    if case .noValidAudioKey = error, index + 1 < downloadCandidates.count {
+                    // A stale captured URL and a key/quality mismatch should
+                    // both fall through to the next freshly resolved candidate.
+                    // A conversion failure is specific to the bytes we already
+                    // matched, so it propagates.
+                    let shouldTryNext: Bool
+                    switch error {
+                    case .noValidAudioKey:
+                        shouldTryNext = true
+                    case .httpStatus(let code)
+                        where code == 400 || code == 403 || code == 404 || code == 416:
+                        shouldTryNext = true
+                    default:
+                        shouldTryNext = false
+                    }
+                    if shouldTryNext, index + 1 < downloadCandidates.count {
                         DownloadLogger.shared.log(
-                            "AUDIO-KEY-PROBE candidate \(candidate.label) did not match a captured key; trying next"
+                            "AUDIO-KEY-PROBE candidate \(candidate.label) failed (\(DownloadManager.describe(error))); trying next"
                         )
                         lastDownloadError = error
                         continue
@@ -416,7 +430,15 @@ final class DownloadManager {
         if let stream = capture.streamInfo(forTrackGID: trackIdentifier) {
             return stream
         }
-        return capture.latestStream
+        // Only fall back to the most recent capture when it provably belongs to
+        // this track. Using another track's stream here would let the key probe
+        // accept it (it only validates the container) and publish the wrong
+        // audio under the current track's filename.
+        if let latest = capture.latestStream,
+           latest.trackGID == rawID || latest.trackGID == trackIdentifier {
+            return latest
+        }
+        return nil
     }
 
     // MARK: - Helpers

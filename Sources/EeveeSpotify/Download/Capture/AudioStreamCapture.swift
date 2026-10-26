@@ -351,7 +351,8 @@ final class AudioStreamCapture {
     // MARK: - Accessors for other lanes
 
     /// Fully captured stream for a track (resolved via the track's last known
-    /// fileId). Falls back to the latest stream if the exact fileId is unknown.
+    /// fileId). Does not fall back to an unrelated track's stream; callers that
+    /// want the most recent capture must check its `trackGID` explicitly.
     func streamInfo(forTrackGID gid: String) -> AudioStream? {
         lock.lock()
         defer { lock.unlock() }
@@ -361,7 +362,7 @@ final class AudioStreamCapture {
         if let stream = _streamsByFileID["legacy-\(gid)"] {
             return stream
         }
-        return _latestStream
+        return nil
     }
 
     /// The 40-hex audio-file identifier last associated with a track, if known.
