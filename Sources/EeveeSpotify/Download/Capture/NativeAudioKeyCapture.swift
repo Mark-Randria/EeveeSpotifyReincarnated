@@ -61,21 +61,52 @@ final class NativeAudioKeyCapture {
         return Self.runtimeDecryptFunctionAddress() != nil
     }
 
-    /// Resolves the unslid 9.1.70 address through the main image slide and
+    /// Resolves the unslid 9.1.70 address through the Spotify image's slide and
     /// verifies the prologue before allowing Orion to patch it. If Spotify ever
     /// ships a different binary, this returns nil and the hook is skipped.
+    ///
+    /// Do NOT use image index 0: under LiveContainer (and similar loaders) the
+    /// main executable is the loader, so image 0's slide belongs to
+    /// LiveContainer, not Spotify. Adding that slide to the Spotify VA lands in
+    /// the unmapped gap between the two images and crashes at launch while the
+    /// prologue is read. Find the image named `Spotify` instead.
     static func runtimeDecryptFunctionAddress() -> UnsafeMutableRawPointer? {
-        let slide = _dyld_get_image_vmaddr_slide(0)
+        guard let imageIndex = spotifyImageIndex() else {
+            return nil
+        }
+        let slide = _dyld_get_image_vmaddr_slide(imageIndex)
         let runtimeAddress = decryptFunctionFileAddress &+ UInt64(bitPattern: Int64(slide))
         guard let pointer = UnsafeMutableRawPointer(bitPattern: UInt(runtimeAddress)) else {
             return nil
         }
 
+        // Never dereference a pointer that is not inside a loaded image. This
+        // makes a wrong slide or a changed binary fail closed instead of
+        // segfaulting during dyld initializers.
+        var imageInfo = Dl_info()
+        guard dladdr(pointer, &imageInfo) != 0 else {
+            return nil
+        }
+
         let bytes = pointer.assumingMemoryBound(to: UInt8.self)
-        for (index, expected) in expectedPrologue.enumerated() where bytes[index] != expected {
+        for (offset, expected) in expectedPrologue.enumerated() where bytes[offset] != expected {
             return nil
         }
         return pointer
+    }
+
+    /// Index of the loaded Spotify executable, independent of which image is
+    /// dyld's image 0. LiveContainer reports its own executable there.
+    private static func spotifyImageIndex() -> UInt32? {
+        let imageCount = _dyld_image_count()
+        for index in 0..<imageCount {
+            guard let cName = _dyld_get_image_name(index) else { continue }
+            let path = String(cString: cName)
+            let fileName = (path as NSString).lastPathComponent
+            guard fileName == "Spotify" else { continue }
+            return index
+        }
+        return nil
     }
 
     /// Reads the AES-128 key from the key schedule of the live decryptor and
