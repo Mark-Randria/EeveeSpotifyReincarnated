@@ -290,8 +290,17 @@ final class DownloadManager {
                 return
             }
 
-            guard stream.key.count == 16 else {
-                setState(.failed("Audio key not captured yet"))
+            let nativeKeys = NativeAudioKeyCapture.shared.candidateKeys()
+            let playplayHex = stream.key.map { String(format: "%02x", $0) }.joined()
+            DownloadLogger.shared.log(
+                "AUDIO-KEY-CAPTURE candidates=\(nativeKeys.count) playplay=\(playplayHex)"
+            )
+
+            guard !nativeKeys.isEmpty else {
+                DownloadLogger.shared.log(
+                    "AUDIO-KEY-CAPTURE no native key yet — playback must reach the audio decryptor before downloading"
+                )
+                setState(.failed("Audio key not captured yet — start playback, then retry"))
                 return
             }
 
@@ -303,7 +312,7 @@ final class DownloadManager {
 
             let finalURL = try await cdnClient.downloadEncryptedStream(
                 url: stream.url,
-                key: stream.key,
+                keys: nativeKeys,
                 to: directory,
                 fileName: fileName,
                 progress: { [weak self] progress in

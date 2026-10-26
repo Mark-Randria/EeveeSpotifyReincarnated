@@ -1,6 +1,6 @@
 # Advancement — In-App Offline Downloader via Spotify Local Files
 
-**Status:** Phase 1 probe run on-device; playplay HTTP 400 root-caused and fixed in source; rebuild and retest pending
+**Status:** playplay + storage-resolve confirmed live on-device; native 9.1.70 AES key capture and multi-key CDN probe implemented; rebuild and on-device decryption retest pending
 **Date:** 2026-10-23
 **Branch:** `feat/download-impl`
 **Target:** Spotify `9.1.70` (`ipa_original/Spotify_9.1.70.ipa`)
@@ -152,6 +152,33 @@ P0 gaps found before Phase 1:
 - Local Files is a separate source in the Spotify UI. The original Spotify track row is not automatically replaced.
 - The current build has file sharing enabled (verify the IPA's `Info.plist`); it should be disabled later if the goal is app-only output. Keeping files in `Documents` while disabling sharing keeps them app-private but still visible to the app's scanner (to be verified on-device).
 
+### 3.7 Native 9.1.70 audio decryptor (key path)
+
+The playplay response contains an **obfuscated** 16-byte key. Deobfuscating it requires Spotify's PlayPlay VM/token, which is a moving target. Rather than reimplementing it, the pipeline captures the **already-deobfuscated AES key** from the app's own decryptor while the track plays.
+
+Evidence from the 9.1.70 Mach-O (`ipa_original/Spotify_9.1.70.ipa`):
+
+| Item | Value / finding |
+|---|---|
+| Custom audio decrypt entry | VA `0x1069101a0`, signature `(object, streamOffset, out, in, length)` |
+| Function prologue | `ff8301d1 fa6701a9 f85f02a9 f65703a9` (`sub sp, sp, #0x60`, callee-saved pushes) |
+| Fixed CTR IV | VA `0x109afe750` (`72e067fbddcbcf77ebe8bc643f630d93`) |
+| AES T-tables | VA `0x109afe760` |
+| AES block routine | VA `0x106e9290c`; reads the 16-byte AES input at `x0` and round keys at `x0+0x10` |
+| Key-schedule thunk | VA `0x109053200` → `aes_block(object + 0x10, object + 0x2f8)` |
+| Decryptor object layout | `+0x00` mode byte, `+0x10` 16-byte CTR counter/input, `+0x20` 176-byte AES-128 key schedule, `+0x2f8` keystream, `+0x308` block index, `+0x330` second CTR context |
+| **AES key location** | **`object + 0x20`** (first 16 bytes of an AES-128 key schedule are the cipher key) |
+| Ogg prefix | After decryption, skip the first **167 bytes** before the real `OggS` page (matches Votify/librespot) |
+
+Implementation:
+
+- `NativeAudioKeyCapture.swift` resolves the unslid VA through the main-image slide, verifies the function prologue, reads `object + 0x20`, and stores a bounded, deduplicated list of recent keys.
+- `NativeAudioKeyHook.x.swift` uses Orion `FunctionHook` at the runtime address. It is activated only for a build whose version starts with `9.1.70` **and** whose prologue matches, so a different Spotify build cannot be patched at a stale address.
+- `DownloadManager` passes the captured keys (newest first) to `SpotifyCDNClient`.
+- `SpotifyCDNClient` fetches an 8 KiB encrypted prefix with a Range request, tries every captured key, and keeps the one that produces a real container header (`OggS` at 0 or 167, `ftyp` at 4, `fLaC`, `ID3`, or MPEG sync). It then downloads and decrypts the full stream with that key.
+
+This also solves the quality/key mismatch problem: if the app's own stream URL is captured, the download uses the exact file the app is playing, so the captured key is guaranteed to belong to that file. If only metadata candidates are available, the multi-key probe filters out keys from other prefetched tracks.
+
 ---
 
 ## 4. Decisions
@@ -169,6 +196,9 @@ P0 gaps found before Phase 1:
 | D9 | Ignore `AAC_24`/`AAC_48` for music | 24/48 kbps are low quality | Ogg 320 is preferred over them |
 | D10 | Do not use `.ogg` as the final Local Files output | Native scanner does not index it | Transcode to `.m4a` if only Ogg is available |
 | D11 | Keep output in `Documents/EeveeSpotifyDownloads` for now | Matches current scanner/log paths | App-only hardening comes after playback works |
+| D12 | Capture the app's native AES key instead of deobfuscating the playplay blob | The deobfuscator is version/token-specific; the app already has the plaintext key in memory | Works without reimplementing PlayPlay; hook is gated to the exact 9.1.70 binary layout |
+| D13 | Probe multiple captured keys against the first CDN bytes | The app may prefetch several tracks; a bounded key list makes association metadata-free | Wrong-track/prefetched keys are rejected by container magic |
+| D14 | Prefer the app's captured stream URL when available | Guarantees the key and the downloaded file belong to the same file id/quality | Falls back to metadata candidates + multi-key probe |
 
 ---
 
@@ -257,6 +287,25 @@ The final file is renamed with the detected extension. The same read logs the MP
 
 **Workaround:** Reconcile only known audio extensions and skip hidden/staging files.
 
+### 5.6 Wrong key produced random bytes
+
+**Problem:** The first CDN downloads used the 16-byte `obfuscated_key` from the playplay response directly as the AES key. Decryption produced high-entropy garbage:
+
+```text
+AUDIO-FORMAT-PROBE unknown-container head=23c1443539731a1f393c4b5cec619ccf
+download failed: Decrypted file did not contain a valid audio container
+```
+
+**Root cause:** The playplay key is obfuscated per client/version; it is not the AES key. The app's native decryptor receives the deobfuscated key and expands it into the schedule at `object + 0x20`.
+
+**Fix:** Capture the native key schedule (see §3.7), use it for the CDN stream, and validate the key against the container magic before decrypting the whole file.
+
+### 5.7 Ogg has a 167-byte container prefix
+
+**Problem:** Even with the correct key, the decrypted Spotify Ogg starts with a 167-byte container header before the first `OggS` page. The app's parser skips it; the Local Files scanner does not.
+
+**Fix:** Detect `OggS` at offset 167 (preferred), 0 (no prefix), or a small scan window, and publish the file starting at the `OggS` page. The probe also uses offset 167 first so a header byte pattern cannot be mistaken for the real page.
+
 ---
 
 ## 6. Phase 1 implementation (this change)
@@ -303,6 +352,35 @@ The final file is renamed with the detected extension. The same read logs the MP
 - Validates FLAC and MP3 in addition to MP4/Ogg.
 - Still treats an unrecognized container as a failed download (wrong key or unsupported format).
 
+### 6.5 Native key capture + multi-key probe (this change)
+
+New files:
+
+- `Sources/EeveeSpotify/Download/Capture/NativeAudioKeyCapture.swift`
+  - Main-image slide resolution + prologue check for `0x1069101a0`.
+  - Reads `object + 0x20` (AES-128 key schedule), deduplicates, keeps the newest 16 keys.
+  - Logs `AUDIO-KEY-CAPTURE native key=… counter=… total=…`.
+- `Sources/EeveeSpotify/Download/Capture/NativeAudioKeyHook.x.swift`
+  - Orion `FunctionHook` with the five-argument ABI.
+  - `hookWillActivate()` requires version prefix `9.1.70` **and** a matching prologue.
+  - `hookDidActivate()` logs the resolved runtime address.
+- `Tweak.x.swift`
+  - Adds `NativeAudioKeyGroup` and activates it in the 9.1.x branch.
+
+Changed files:
+
+- `DownloadManager.swift`
+  - Logs `AUDIO-KEY-CAPTURE candidates=… playplay=…`.
+  - Fails fast with "start playback, then retry" when no native key has been captured.
+  - Passes the captured keys to the CDN client instead of the obfuscated playplay key.
+- `SpotifyCDNClient.swift`
+  - `downloadEncryptedStream(url:keys:…)` performs an 8 KiB Range probe first.
+  - Tries every captured key and selects the one that produces a container header.
+  - Falls back to a plain GET if the CDN rejects the Range header.
+  - Decrypts the full stream with the selected key.
+  - Detects the 167-byte Ogg prefix and strips it before publishing.
+  - Logs `AUDIO-KEY-PROBE match|miss key=… head=…` and `AUDIO-KEY-PROBE selected …`.
+
 ---
 
 ## 7. How to run the Phase 1 probe
@@ -314,48 +392,55 @@ The final file is renamed with the detected extension. The same read logs the MP
    ./build-ipa-local.sh ipa_original/Spotify_9.1.70.ipa
    ```
 2. Install and launch Spotify 9.1.70 with the tweak.
-3. Log in and play one track online for ~10 seconds.
+3. Log in and play one track online for ~10 seconds. **Playback must reach the audio decryptor** before tapping Download: this is what captures the native AES key.
 4. Open the Eevee Downloads settings for that track and tap **Download** once.
 5. Read the log:
    - `Documents/EeveeSpotifyDownloads/eevee.log` via the Files app (file sharing is currently enabled), LiveContainer's "Open Data Folder", or Console.app.
-6. Collect every line containing `AUDIO-FORMAT-PROBE`:
+6. Collect every line containing `AUDIO-FORMAT-PROBE`, `AUDIO-KEY-CAPTURE`, or `AUDIO-KEY-PROBE`:
    ```bash
-   grep 'AUDIO-FORMAT-PROBE' Documents/EeveeSpotifyDownloads/eevee.log
+   grep -E 'AUDIO-(FORMAT|KEY)-' Documents/EeveeSpotifyDownloads/eevee.log
    ```
 
-`DownloadLogger` also mirrors every line to `NSLog`, so Console.app can filter on `AUDIO-FORMAT-PROBE` if the file is not reachable.
+`DownloadLogger` also mirrors every line to `NSLog`, so Console.app can filter on `AUDIO-` if the file is not reachable.
 
 Expected log shape:
 
 ```text
+[EeveeDownload] [INIT] Activated NativeAudioKeyGroup
+[EeveeDownload] AUDIO-KEY-CAPTURE hook active address=0x...
+[EeveeDownload] AUDIO-KEY-CAPTURE native key=<32 hex> counter=<32 hex> total=1
 [EeveeDownload] AUDIO-FORMAT-PROBE track=spotify:track:...
-[EeveeDownload] AUDIO-FORMAT-PROBE candidates=[MP4_256(raw=11,hint=mp4,drm=true,rank=100):... | OGG_VORBIS_320(raw=2,hint=ogg,drm=false,rank=90):... | ...]
-[EeveeDownload] AUDIO-FORMAT-PROBE http status=200 contentType=... length=... urlExt=<none>
-[EeveeDownload] AUDIO-FORMAT-PROBE resolving fileId=... format=MP4_256 ...
-[EeveeDownload] AUDIO-FORMAT-PROBE resolvable fileId=... format=MP4_256 key=16B cdnExt=<none> cdnHost=...
-[EeveeDownload] AUDIO-FORMAT-PROBE unavailable fileId=... format=... error=...
-[EeveeDownload] AUDIO-FORMAT-PROBE selected fileId=... format=OGG_VORBIS_320 hint=ogg rank=90
+[EeveeDownload] AUDIO-FORMAT-PROBE candidates=[OGG_VORBIS_320(raw=2,hint=ogg,drm=false,rank=90):... | ...]
+[EeveeDownload] AUDIO-KEY-CAPTURE candidates=1 playplay=<32 hex>
+[EeveeDownload] AUDIO-KEY-PROBE match key=<32 hex> container=ogg offset=167 head=...
+[EeveeDownload] AUDIO-KEY-PROBE selected container=ogg offset=167 probe=8192B
 [EeveeDownload] AUDIO-FORMAT-PROBE container=ogg urlExt=<none> stagedExt=ogg final=Artist - Title.ogg
-[EeveeDownload] AUDIO-FORMAT-PROBE ogg codec=vorbis head=4f676753...
+[EeveeDownload] AUDIO-FORMAT-PROBE stripped ogg prefix bytes=167
+[EeveeDownload] AUDIO-FORMAT-PROBE ogg codec=vorbis magicOffset=167 head=4f676753...
 ```
 
-The probe's selected download is still the first resolvable candidate. It may be Ogg, so the `container=` line may show `ogg` even when MP4 candidates exist. The `resolvable`/`unavailable` lines are what tell us whether MP4 is reachable.
+If there are no `AUDIO-KEY-CAPTURE` lines, the hook was not activated or the app's playback does not call the hooked decryptor. Check `[INIT] Activated NativeAudioKeyGroup`, then `AUDIO-KEY-CAPTURE hook active address=…`. If the hook is active but never fires, the playback may not have started, or the app build/layout differs from `9.1.70`.
+
+If the log shows `AUDIO-KEY-PROBE miss` for every key, the key belongs to a different file id/quality than the selected candidate. The safest fix is to let the app play the target track so the passive stream URL is captured, or add a per-candidate probe loop instead of picking the first resolvable candidate.
 
 On 9.1.70 passive capture is rare. If the log shows `AUDIO-FORMAT-PROBE skipped` or `candidates=[captured:UNKNOWN ...]`, the probe did not query TRACK_V4 metadata; try a different track or restart the app so the active resolver path runs.
 
-### 7.1 Probe results (on-device, 9.1.70, 2026-10-22)
+### 7.1 Probe results (on-device, 9.1.70)
 
 | Field | Value |
 |---|---|
 | Track URI | `spotify:track:6mIiV28R5NjFBuSo31u2ER` (also `spotify:track:4ODMW1oOz3yppcetVmb0By`) |
 | Candidate formats (in order) | `OGG_VORBIS_320` (`9ba22f13…`), `OGG_VORBIS_160` (`b4ef7fd1…`), `OGG_VORBIS_96` (`26f66575…`), `AAC_24` (`2a0439b4…`) |
-| MP4 resolvable? | No MP4 candidates offered for either tested track |
-| Selected format | None — every candidate failed at playplay |
-| Decrypted container | — |
-| MP4 brand / DRM markers | — |
+| MP4 candidates? | No MP4 offered for either tested track |
+| playplay after body fix | All four candidates `resolvable`, `key=16B` |
+| storage-resolve | Reachable; returned `audio-ak.spotifycdn.com` |
+| CDN download | HTTP 200, `application/octet-stream`, ~8 MB |
+| Decryption with obfuscated playplay key | Failed: `unknown-container head=23c1443539731a1f393c4b5cec619ccf` |
+| Native key capture | Implemented; on-device retest pending |
+| Decrypted container | — (previous attempt used the wrong key) |
 | Ogg codec | — |
 | Playback result offline | — |
-| Notes | All four candidates returned `playplay responded with HTTP 400`; second track identical. Root cause was the malformed request body in §5.2, now fixed. `storage-resolve` for the app's own playback was observed, confirming the session/token path is live. |
+| Notes | The playplay HTTP 400 was fixed by correcting the 30-byte request body (§5.2). The request layer now succeeds end-to-end through the CDN download. The remaining gate is using the app's deobfuscated native key (§3.7) and stripping the 167-byte Ogg prefix. |
 
 ---
 
@@ -380,8 +465,9 @@ On 9.1.70 passive capture is rare. If the log shows `AUDIO-FORMAT-PROBE skipped`
 |---|---|---|
 | **M0 — Research and route selection** | Done | Native offline ruled out; Local Files accepted; OnTheSpot protocol mapped |
 | **M1 — Phase 1 probe code** | Done in source | Parser exposes formats; resolver exposes candidates; downloader logs candidates and container; no selection change |
-| **M2 — On-device probe** | In progress | Candidate list captured; playplay 400 root-caused and fixed; rebuild/retest to get a resolvable candidate |
-| **M3 — Direct MP4 path** | Pending (gated on M2) | If MP4 resolves and is playable: rank MP4 first, output `.m4a`, verify offline playback. M2 showed no MP4 candidates, so M4 is the likely path |
+| **M2 — On-device probe** | Done | Candidate list captured; playplay 400 fixed; all Ogg candidates resolvable; storage-resolve + CDN download confirmed |
+| **M2.5 — Native key + decryption** | In progress | Hook captures the 9.1.70 native AES key; multi-key probe selects it; decrypted bytes contain `OggS`; 167-byte prefix stripped |
+| **M3 — Direct MP4 path** | Not applicable (no MP4 offered) | If a future track offers MP4 and it is playable: rank MP4 first, output `.m4a`, verify offline playback. Tested tracks offered no MP4, so M4 is the path |
 | **M4 — Ogg → AAC/M4A transcode** | Pending | If MP4 is unavailable/DRM: Ogg 320 decodes and encodes to `.m4a`; duration/seek correct |
 | **M5 — Local Files verification** | Pending | Track appears under Local Files and plays in airplane mode after relaunch |
 | **M6 — Polish and app-only hardening** | Pending | Metadata/artwork, retry/cancel, duplicate handling, file sharing disabled, storage cleanup |
@@ -392,6 +478,14 @@ On 9.1.70 passive capture is rare. If the log shows `AUDIO-FORMAT-PROBE skipped`
 - Every candidate has a `resolving` line and either `resolvable` or `unavailable`.
 - The selected file produces a `container=` line.
 - The log can be retrieved from the device.
+
+### M2.5 acceptance detail
+
+- `[INIT] Activated NativeAudioKeyGroup` and `AUDIO-KEY-CAPTURE hook active address=…` appear after launch.
+- Playing the target track produces at least one `AUDIO-KEY-CAPTURE native key=…` line.
+- Pressing Download produces `AUDIO-KEY-PROBE match … offset=167` (or `offset=0`) and `AUDIO-KEY-PROBE selected …`.
+- The decrypted staging file contains `OggS` at the detected offset and is stripped to start with `OggS`.
+- The resulting Ogg can be inspected/replayed locally before the M4 transcode.
 
 ### M3 go/no-go
 
@@ -407,11 +501,12 @@ If any condition fails, move to M4.
 
 ### M4 implementation outline
 
-- Embed a small Vorbis decoder (libvorbis or equivalent).
+- Keep the decrypted Ogg as an intermediate while validating M2.5; it is **not** the final Local Files format.
+- Embed a small Vorbis decoder (libogg + libvorbis, or a small equivalent) in `Sources/EeveeSpotifyC`.
 - Decode Ogg pages → PCM.
-- Encode PCM → AAC in an `.m4a` container with `ExtAudioFile` or `AVAudioConverter`.
+- Encode PCM → AAC in an `.m4a` container with `ExtAudioFile` / `AudioConverter` / `AVAssetWriter`.
 - Add metadata/artwork after playback works.
-- Do not embed desktop FFmpeg.
+- Do not embed desktop FFmpeg. Do not rename Ogg to `.m4a`; the scanner/player must see a real AAC/MP4 container.
 
 ---
 
@@ -425,7 +520,10 @@ If any condition fails, move to M4.
 6. **Transcoder binary size and licensing.** libvorbis is small and permissive, but still needs an iOS build and integration.
 7. **`storage-resolve` product/path parameter.** The current request uses `product=0` and the interactive audio path. MP4/EME files may require a different product or path; an `unavailable` MP4 result is not proof that the file is globally unavailable.
 8. **No build/test in this workspace.** The source changes are not compiled; the next real gate is the macOS build and the on-device probe.
-9. **Personal-use/ToS risk.** This is an in-app personal downloader; do not distribute downloaded content.
+9. **Hook address/version coupling.** `0x1069101a0` and the `object + 0x20` layout are specific to the 9.1.70 IPA. The hook checks the version prefix and the function prologue before patching; a different build must be re-analyzed rather than reused.
+10. **Key/file-id association.** The app may prefetch the next track's key. The multi-key probe rejects wrong keys, but the selected CDN file must be a file the app has actually decrypted. Preferring the app's captured stream URL avoids this; otherwise the first resolvable candidate may be a different quality than the playback.
+11. **Transcoder licensing/size.** libogg/libvorbis are permissive and small, but still need an iOS build and integration. The `.m4a` encoder can use system AudioToolbox, keeping binary growth modest.
+12. **Personal-use/ToS risk.** This is an in-app personal downloader; do not distribute downloaded content.
 
 ---
 
@@ -448,3 +546,4 @@ If any condition fails, move to M4.
 | 2026-10-22 | Created this document; captured route decision, findings, workarounds, Phase 1 implementation, and milestones |
 | 2026-10-22 | Phase 1 source changes: `AudioFile.format` parsing, candidate resolution logging, container sniffing, reconcile filter |
 | 2026-10-23 | On-device probe recorded: no MP4 offered; all playplay calls 400. Root-caused the 400 to a malformed `PlayPlayLicenseRequest` body (one dropped token byte + invalid timestamp varint). Corrected `SpotifyAPIResolver.playplayRequestBody`; retest pending. |
+| 2026-10-23 | On-device retest: all four candidates resolvable; storage-resolve and CDN download succeed; decryption with the obfuscated playplay key produces random bytes. Added `NativeAudioKeyCapture` + Orion `NativeAudioKeyHook` at `0x1069101a0`; key schedule is at `object + 0x20`. Added multi-key Range probe and 167-byte Ogg prefix stripping to `SpotifyCDNClient`; retest pending. |

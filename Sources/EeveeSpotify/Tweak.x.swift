@@ -86,6 +86,7 @@ struct NonIOS14PremiumPatchingGroup: HookGroup { }
 struct IOS14And15PremiumPatchingGroup: HookGroup { }
 struct V91PremiumPatchingGroup: HookGroup { } // For Spotify 9.1.x versions
 struct LatestPremiumPatchingGroup: HookGroup { }
+struct NativeAudioKeyGroup: HookGroup { } // 9.1.70 custom AES decryptor
 
 func activatePremiumPatchingGroup() {
     BasePremiumPatchingGroup().activate()
@@ -437,6 +438,16 @@ struct EeveeSpotify: Tweak {
             } else {
                 writeDebugLog("[INIT] Settings_PlatformImpl.SettingsListViewController missing")
             }
+            // Capture the already-deobfuscated AES key from Spotify's own
+            // 9.1.70 audio decryptor. This is what makes CDN downloads
+            // decryptable without reimplementing the PlayPlay key VM.
+            if NativeAudioKeyCapture.shared.isSupported {
+                NativeAudioKeyGroup().activate()
+                writeDebugLog("[INIT] Activated NativeAudioKeyGroup")
+            } else {
+                writeDebugLog("[INIT] Skipped NativeAudioKeyGroup (unsupported Spotify build/address)")
+            }
+
             NSLog("[EeveeSpotify] Initialization complete for 9.1.x")
             TrueShuffleHook.install()
             activateEeveeProbes()

@@ -17,6 +17,7 @@ final class SpotifyCDNClient {
         case httpStatus(Int)
         case moveTempFile(String)
         case invalidOutput
+        case noValidAudioKey
 
         var errorDescription: String? {
             switch self {
@@ -26,6 +27,8 @@ final class SpotifyCDNClient {
                 return "Could not stage CDN file: \(reason)"
             case .invalidOutput:
                 return "Decrypted file did not contain a valid audio container"
+            case .noValidAudioKey:
+                return "No captured Spotify audio key decrypted this stream"
             }
         }
     }
@@ -51,6 +54,25 @@ final class SpotifyCDNClient {
             }
         }
     }
+
+    /// Result of sniffing decrypted bytes. `magicOffset` is non-zero when
+    /// Spotify's Ogg stream has the 167-byte container prefix that the app's
+    /// own decryptor/parser skips.
+    private struct DetectedContainer {
+        let container: AudioContainer
+        let magicOffset: Int
+    }
+
+    private struct KeySelection {
+        let key: Data
+        let container: AudioContainer
+        let magicOffset: Int
+    }
+
+    /// 8 KiB is enough to cover the 167-byte Spotify Ogg prefix and the first
+    /// MP4 boxes. The probe is a single Range request, not a second full
+    /// download.
+    private static let probeByteCount = 8192
 
     private let session: URLSession
     private let downloadDelegate: DownloadProgressDelegate
@@ -97,11 +119,42 @@ final class SpotifyCDNClient {
     /// NOT sent here: CDN URLs are typically signed, so the token is not required.
     func downloadEncryptedStream(
         url: URL,
-        key: Data,
+        keys: [Data],
         to outputDirectory: URL,
         fileName: String,
         progress: ((Double) -> Void)?
     ) async throws -> URL {
+        let validKeys = keys.filter { $0.count == 16 }
+        guard !validKeys.isEmpty else {
+            throw CDNError.noValidAudioKey
+        }
+
+        // Pick the captured key BEFORE downloading the whole stream. The CDN
+        // supports Range, so this is one 8 KiB request instead of a second
+        // full download. Trying the wrong PlayPlay key is what produced the
+        // high-entropy "unknown-container" failures in the previous build.
+        let encryptedProbe: Data
+        do {
+            encryptedProbe = try await fetchPrefix(url: url, length: Self.probeByteCount)
+        }
+        catch {
+            DownloadLogger.shared.log(
+                "AUDIO-KEY-PROBE range request failed: \(error.localizedDescription)"
+            )
+            throw error
+        }
+
+        guard let selection = Self.selectKey(encryptedProbe: encryptedProbe, keys: validKeys) else {
+            DownloadLogger.shared.log(
+                "AUDIO-KEY-PROBE no captured key produced a known container (probe=\(encryptedProbe.count)B keys=\(validKeys.count))"
+            )
+            throw CDNError.noValidAudioKey
+        }
+
+        DownloadLogger.shared.log(
+            "AUDIO-KEY-PROBE selected container=\(selection.container.rawValue) offset=\(selection.magicOffset) probe=\(encryptedProbe.count)B"
+        )
+
         // The CDN URL extension is only a staging hint. The FINAL extension is
         // chosen after decryption from the actual magic bytes, because the
         // local-files scanner keys off the extension and the CDN URL is often
@@ -129,7 +182,7 @@ final class SpotifyCDNClient {
 
         let cryptor: StreamCTREncryptor
         do {
-            cryptor = try StreamCTREncryptor(key: key)
+            cryptor = try StreamCTREncryptor(key: selection.key)
         }
         catch {
             try? fileHandle.close()
@@ -137,6 +190,7 @@ final class SpotifyCDNClient {
             throw error
         }
 
+        var publishURL = stagingURL
         do {
             let stagedURL = try await withCheckedThrowingContinuation { continuation in
                 downloadDelegate.beginDownload(
@@ -155,25 +209,46 @@ final class SpotifyCDNClient {
             // the delegate fsynced and closed the handle.
             assert(stagedURL == stagingURL)
 
-            let container: AudioContainer
+            let detected: DetectedContainer
             do {
-                container = try Self.detectAudioContainer(stagingURL)
+                detected = try Self.detectAudioContainer(stagedURL)
             }
             catch {
-                try? fileManager.removeItem(at: stagingURL)
+                try? fileManager.removeItem(at: stagedURL)
                 throw error
+            }
+
+            // Spotify's Ogg decrypts to a 167-byte container prefix followed by
+            // the real `OggS` page. The app's own parser skips that prefix; the
+            // Local Files scanner will not, so strip it before publishing.
+            if detected.container == .ogg, detected.magicOffset > 0 {
+                let strippedURL = outputDirectory
+                    .appendingPathComponent(".\(fileName).stripped.tmp")
+                try? fileManager.removeItem(at: strippedURL)
+                do {
+                    try Self.copy(from: stagedURL, offset: detected.magicOffset, to: strippedURL)
+                    try? fileManager.removeItem(at: stagedURL)
+                    publishURL = strippedURL
+                    DownloadLogger.shared.log(
+                        "AUDIO-FORMAT-PROBE stripped ogg prefix bytes=\(detected.magicOffset)"
+                    )
+                }
+                catch {
+                    try? fileManager.removeItem(at: strippedURL)
+                    throw error
+                }
             }
 
             let finalURL = outputDirectory
                 .appendingPathComponent(fileName, isDirectory: false)
-                .appendingPathExtension(container.fileExtension)
+                .appendingPathExtension(detected.container.fileExtension)
 
             DownloadLogger.shared.log(
-                "AUDIO-FORMAT-PROBE container=\(container.rawValue) urlExt=\(url.pathExtension.isEmpty ? "<none>" : url.pathExtension) stagedExt=\(urlExtension) final=\(finalURL.lastPathComponent)"
+                "AUDIO-FORMAT-PROBE container=\(detected.container.rawValue) urlExt=\(url.pathExtension.isEmpty ? "<none>" : url.pathExtension) stagedExt=\(urlExtension) final=\(finalURL.lastPathComponent)"
             )
 
             do {
-                _ = try fileManager.replaceItemAt(finalURL, withItemAt: stagingURL)
+                _ = try fileManager.replaceItemAt(finalURL, withItemAt: publishURL)
             }
             catch {
                 // replaceItemAt can fail on some filesystems (e.g. when the
@@ -181,10 +256,10 @@ final class SpotifyCDNClient {
                 // move, removing any stale final file first.
                 try? fileManager.removeItem(at: finalURL)
                 do {
-                    try fileManager.moveItem(at: stagingURL, to: finalURL)
+                    try fileManager.moveItem(at: publishURL, to: finalURL)
                 }
                 catch let moveError {
-                    try? fileManager.removeItem(at: stagingURL)
+                    try? fileManager.removeItem(at: publishURL)
                     throw CDNError.moveTempFile(moveError.localizedDescription)
                 }
             }
@@ -198,7 +273,189 @@ final class SpotifyCDNClient {
             try? fileHandle.close()
             try? cryptor.finalize()
             try? fileManager.removeItem(at: stagingURL)
+            if publishURL != stagingURL {
+                try? fileManager.removeItem(at: publishURL)
+            }
             throw error
+        }
+    }
+
+    // MARK: - Key selection
+
+    /// Fetches only the first `length` encrypted bytes. Spotify's CDN supports
+    /// Range; if a server ignores it, URLSession will simply deliver more data
+    /// and the key probe ignores the tail. A rejected Range request falls back
+    /// to a plain GET so a CDN edge that dislikes the header cannot block the
+    /// whole download.
+    private func fetchPrefix(url: URL, length: Int) async throws -> Data {
+        do {
+            return try await fetchPrefixOnce(url: url, length: length, useRange: true)
+        }
+        catch let error as CDNError {
+            if case .httpStatus(let code) = error, code == 400 || code == 403 || code == 416 {
+                DownloadLogger.shared.log(
+                    "AUDIO-KEY-PROBE range request status=\(code); retrying without Range"
+                )
+                return try await fetchPrefixOnce(url: url, length: length, useRange: false)
+            }
+            throw error
+        }
+    }
+
+    private func fetchPrefixOnce(url: URL, length: Int, useRange: Bool) async throws -> Data {
+        var request = URLRequest(url: url)
+        if useRange {
+            request.setValue("bytes=0-\(max(0, length - 1))", forHTTPHeaderField: "Range")
+        }
+        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        request.timeoutInterval = 30
+
+        return try await withCheckedThrowingContinuation { continuation in
+            let task = session.dataTask(with: request) { data, response, error in
+                if let error = error {
+                    continuation.resume(throwing: error)
+                    return
+                }
+                if let http = response as? HTTPURLResponse,
+                   !(200..<300).contains(http.statusCode) {
+                    continuation.resume(throwing: CDNError.httpStatus(http.statusCode))
+                    return
+                }
+                guard let data = data, !data.isEmpty else {
+                    continuation.resume(throwing: CDNError.invalidOutput)
+                    return
+                }
+                continuation.resume(returning: data)
+            }
+            task.resume()
+        }
+    }
+
+    /// Tries every captured key against the encrypted prefix. The correct key
+    /// produces a real container header; wrong keys produce high-entropy bytes
+    /// and are discarded.
+    private static func selectKey(encryptedProbe: Data, keys: [Data]) -> KeySelection? {
+        for key in keys {
+            do {
+                let cryptor = try StreamCTREncryptor(key: key)
+                let decrypted = try cryptor.decrypt(encryptedProbe)
+                try? cryptor.finalize()
+
+                let keyHex = key.map { String(format: "%02x", $0) }.joined()
+                let headHex = decrypted.prefix(16).map { String(format: "%02x", $0) }.joined()
+
+                if let detected = detectContainer(in: decrypted) {
+                    DownloadLogger.shared.log(
+                        "AUDIO-KEY-PROBE match key=\(keyHex) container=\(detected.container.rawValue) offset=\(detected.magicOffset) head=\(headHex)"
+                    )
+                    return KeySelection(
+                        key: key,
+                        container: detected.container,
+                        magicOffset: detected.magicOffset
+                    )
+                }
+
+                DownloadLogger.shared.log(
+                    "AUDIO-KEY-PROBE miss key=\(keyHex) head=\(headHex)"
+                )
+            }
+            catch {
+                DownloadLogger.shared.log(
+                    "AUDIO-KEY-PROBE error keyLength=\(key.count) error=\(error.localizedDescription)"
+                )
+            }
+        }
+        return nil
+    }
+
+    private static func detectContainer(in data: Data) -> DetectedContainer? {
+        let bytes = [UInt8](data)
+        guard bytes.count >= 4 else { return nil }
+
+        // Ogg: Spotify prepends a 167-byte container header before the real
+        // `OggS` page. Check the known Spotify offset FIRST — the header itself
+        // must not win if it happens to contain the magic. Then fall back to
+        // offset 0 for a prefix-less Ogg, and finally scan a small window for a
+        // future header-size change. The Ogg version byte must be 0.
+        func isOggPage(at offset: Int) -> Bool {
+            guard offset >= 0, offset + 4 < bytes.count else { return false }
+            return bytes[offset] == 0x4F
+                && bytes[offset + 1] == 0x67
+                && bytes[offset + 2] == 0x67
+                && bytes[offset + 3] == 0x53
+                && bytes[offset + 4] == 0
+        }
+
+        if isOggPage(at: 167) {
+            return DetectedContainer(container: .ogg, magicOffset: 167)
+        }
+        if isOggPage(at: 0) {
+            return DetectedContainer(container: .ogg, magicOffset: 0)
+        }
+        let oggScanLimit = min(max(0, bytes.count - 5), 1024)
+        if oggScanLimit > 0 {
+            for offset in 1..<oggScanLimit where offset != 167 {
+                if isOggPage(at: offset) {
+                    return DetectedContainer(container: .ogg, magicOffset: offset)
+                }
+            }
+        }
+
+        if bytes.count >= 12,
+           bytes[4] == 0x66, bytes[5] == 0x74, bytes[6] == 0x79, bytes[7] == 0x70 {
+            return DetectedContainer(container: .mp4, magicOffset: 0)
+        }
+
+        if bytes[0] == 0x66, bytes[1] == 0x4C, bytes[2] == 0x61, bytes[3] == 0x43 {
+            return DetectedContainer(container: .flac, magicOffset: 0)
+        }
+
+        // MP3: an ID3 tag or an MPEG audio frame sync (11 set bits).
+        let isID3 = bytes.count >= 3 && bytes[0] == 0x49 && bytes[1] == 0x44 && bytes[2] == 0x33
+        let isMPEGSync = bytes.count >= 2 && bytes[0] == 0xFF && (bytes[1] & 0xE0) == 0xE0
+        if isID3 || isMPEGSync {
+            return DetectedContainer(container: .mp3, magicOffset: 0)
+        }
+
+        return nil
+    }
+
+    /// Copies `source` into `destination` starting at `offset`. Used to remove
+    /// Spotify's 167-byte Ogg prefix without loading the whole track in memory.
+    private static func copy(from source: URL, offset: Int, to destination: URL) throws {
+        let input: FileHandle
+        do {
+            input = try FileHandle(forReadingFrom: source)
+        }
+        catch {
+            throw CDNError.moveTempFile("could not open decrypted staging file")
+        }
+        defer { try? input.close() }
+
+        guard FileManager.default.createFile(atPath: destination.path, contents: nil, attributes: nil) else {
+            throw CDNError.moveTempFile("could not create Ogg staging file")
+        }
+
+        let output: FileHandle
+        do {
+            output = try FileHandle(forWritingTo: destination)
+        }
+        catch {
+            throw CDNError.moveTempFile("could not open Ogg staging file")
+        }
+        defer { try? output.close() }
+
+        do {
+            try input.seek(toOffset: UInt64(offset))
+            while true {
+                let chunk = try input.read(upToCount: 64 * 1024) ?? Data()
+                if chunk.isEmpty { break }
+                try output.write(contentsOf: chunk)
+            }
+            output.synchronizeFile()
+        }
+        catch {
+            throw CDNError.moveTempFile(error.localizedDescription)
         }
     }
 
@@ -210,7 +467,7 @@ final class SpotifyCDNClient {
     /// Also logs the container, the MP4 brand and any DRM boxes (`pssh`/`sinf`/
     /// `enca`/`schm`), which is exactly what the Phase 1 format probe needs to
     /// decide whether a direct MP4 path is viable.
-    private static func detectAudioContainer(_ url: URL) throws -> AudioContainer {
+    private static func detectAudioContainer(_ url: URL) throws -> DetectedContainer {
         guard let handle = try? FileHandle(forReadingFrom: url) else {
             throw CDNError.invalidOutput
         }
@@ -220,8 +477,13 @@ final class SpotifyCDNClient {
         }
 
         let headerHex = head.prefix(16).map { String(format: "%02x", $0) }.joined()
+        guard let detected = detectContainer(in: head) else {
+            DownloadLogger.shared.log("AUDIO-FORMAT-PROBE unknown-container head=\(headerHex)")
+            throw CDNError.invalidOutput
+        }
 
-        if head.subdata(in: 4..<8) == Data("ftyp".utf8) {
+        switch detected.container {
+        case .mp4:
             let brand: String
             if head.count >= 12,
                let ascii = String(data: head.subdata(in: 8..<12), encoding: .ascii) {
@@ -235,10 +497,7 @@ final class SpotifyCDNClient {
             DownloadLogger.shared.log(
                 "AUDIO-FORMAT-PROBE mp4 brand=\(brand) drmMarkers=[\(drmMarkers.joined(separator: ","))] head=\(headerHex)"
             )
-            return .mp4
-        }
-
-        if head.subdata(in: 0..<4) == Data("OggS".utf8) {
+        case .ogg:
             let codec: String
             if head.range(of: Data("OpusHead".utf8)) != nil {
                 codec = "opus"
@@ -248,26 +507,15 @@ final class SpotifyCDNClient {
                 codec = "unknown"
             }
             DownloadLogger.shared.log(
-                "AUDIO-FORMAT-PROBE ogg codec=\(codec) head=\(headerHex)"
+                "AUDIO-FORMAT-PROBE ogg codec=\(codec) magicOffset=\(detected.magicOffset) head=\(headerHex)"
             )
-            return .ogg
-        }
-
-        if head.subdata(in: 0..<4) == Data("fLaC".utf8) {
+        case .flac:
             DownloadLogger.shared.log("AUDIO-FORMAT-PROBE flac head=\(headerHex)")
-            return .flac
-        }
-
-        // MP3: an ID3 tag or an MPEG audio frame sync (11 set bits).
-        let isID3 = head.count >= 3 && head.subdata(in: 0..<3) == Data("ID3".utf8)
-        let isMPEGSync = head.count >= 2 && head[0] == 0xFF && (head[1] & 0xE0) == 0xE0
-        if isID3 || isMPEGSync {
+        case .mp3:
             DownloadLogger.shared.log("AUDIO-FORMAT-PROBE mp3 head=\(headerHex)")
-            return .mp3
         }
 
-        DownloadLogger.shared.log("AUDIO-FORMAT-PROBE unknown-container head=\(headerHex)")
-        throw CDNError.invalidOutput
+        return detected
     }
 
     private static func audioExtension(for url: URL) -> String {
