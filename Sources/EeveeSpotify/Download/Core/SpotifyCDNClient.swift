@@ -201,7 +201,12 @@ final class SpotifyCDNClient {
                     continuation: continuation
                 )
 
-                let task = session.dataTask(with: url)
+                var request = URLRequest(url: url)
+                // The key probe already fetched the same URL with a Range
+                // header; never let a cached partial response masquerade as the
+                // full stream body.
+                request.cachePolicy = .reloadIgnoringLocalCacheData
+                let task = session.dataTask(with: request)
                 downloadDelegate.setActiveTask(task)
                 task.resume()
             }
@@ -745,6 +750,24 @@ private final class DownloadProgressDelegate: NSObject, URLSessionDataDelegate {
         // Success: flush (fsync) once, close, then hand the staging URL to the
         // continuation for magic-byte validation + atomic rename.
         do {
+            // A short body that URLSession did not report as an error would
+            // otherwise decode into a truncated AAC file. Reject it so the
+            // candidate loop can retry instead of publishing a partial track.
+            if expectedContentLength > 0, receivedBytes < expectedContentLength {
+                DownloadLogger.shared.log(
+                    "AUDIO-FORMAT-PROBE truncated body received=\\(receivedBytes)/\\(expectedContentLength)"
+                )
+                if let cryptor = cryptor {
+                    try? cryptor.finalize()
+                }
+                try? fileHandle?.close()
+                if let stagingURL = stagingURL {
+                    try? FileManager.default.removeItem(at: stagingURL)
+                }
+                clearActiveState()
+                resumeContinuation(.failure(SpotifyCDNClient.CDNError.invalidOutput))
+                return
+            }
             if let cryptor = cryptor {
                 try cryptor.finalize()
             }
