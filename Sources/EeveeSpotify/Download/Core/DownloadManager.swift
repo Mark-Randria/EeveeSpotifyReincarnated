@@ -219,8 +219,7 @@ final class DownloadManager {
                         clientID: capture.clientID
                     )
                     let fetched = fetchedUnsorted.sorted { $0.qualityRank > $1.qualityRank }
-                    for candidate in fetched
-                    where !candidates.contains(where: { $0.fileID == candidate.fileID }) {
+                    for candidate in fetched where !candidates.contains(where: { $0.fileID == candidate.fileID }) {
                         candidates.append(candidate)
                     }
                     DownloadLogger.shared.log(
