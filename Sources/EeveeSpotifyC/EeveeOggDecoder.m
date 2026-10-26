@@ -1,3 +1,8 @@
+// The implementation is plain C, but this file is named `.m` on purpose: the
+// EeveeSpotifyC module map uses an umbrella header that also exposes Tweak.h
+// (which imports Foundation). Compiling this file as C makes Clang try to build
+// an Objective-C module from a C translation unit and fail with
+// "module 'ObjectiveC.NSObject' requires feature 'objc'".
 #include "EeveeOggDecoder.h"
 
 // Pull in stb_vorbis's declarations only. The implementation is compiled from
