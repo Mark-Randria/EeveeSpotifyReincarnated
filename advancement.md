@@ -13,7 +13,7 @@
 Build an in-app-only downloader that:
 
 1. Downloads a track's audio through Spotify's own session and CDN.
-2. Decrypts it with the app's own `playplay` key.
+2. Decrypts it by capturing the already-deobfuscated AES-128 key from the app's own native audio decryptor (the PlayPlay response key is obfuscated and version-dependent).
 3. Writes a container the native Spotify iOS player can play offline.
 4. Makes the file appear in Spotify's Local Files source.
 
@@ -425,24 +425,28 @@ Expected log shape:
 ```text
 [EeveeDownload] [INIT] Activated NativeAudioKeyGroup
 [EeveeDownload] AUDIO-KEY-CAPTURE hook active address=0x...
-[EeveeDownload] AUDIO-KEY-CAPTURE native key=<32 hex> counter=<32 hex> total=1
+[EeveeDownload] AUDIO-KEY-CAPTURE native key=<32 hex> counter=<32 hex> mode=1 total=1
 [EeveeDownload] AUDIO-FORMAT-PROBE track=spotify:track:...
 [EeveeDownload] AUDIO-FORMAT-PROBE candidates=[OGG_VORBIS_320(raw=2,hint=ogg,drm=false,rank=90):... | ...]
-[EeveeDownload] AUDIO-KEY-CAPTURE candidates=1 playplay=<32 hex>
+[EeveeDownload] AUDIO-KEY-CAPTURE candidates=1 downloadCandidates=5
+[EeveeDownload] AUDIO-KEY-CAPTURE candidate=<fileId>:OGG_VORBIS_320 playplay=<32 hex>
+[EeveeDownload] AUDIO-KEY-PROBE trying candidate=<fileId>:OGG_VORBIS_320 index=1/5
 [EeveeDownload] AUDIO-KEY-PROBE match key=<32 hex> container=ogg offset=167 head=...
 [EeveeDownload] AUDIO-KEY-PROBE selected container=ogg offset=167 probe=8192B
 [EeveeDownload] AUDIO-FORMAT-PROBE container=ogg urlExt=<none> stagedExt=ogg final=Artist - Title.m4a finalContainer=mp4
 [EeveeDownload] AUDIO-FORMAT-PROBE stripped ogg prefix bytes=167
 [EeveeDownload] AUDIO-FORMAT-PROBE ogg codec=vorbis magicOffset=167 head=4f676753...
 [EeveeDownload] AUDIO-CONVERT start ogg->m4a channels=2 sampleRate=44100 source=...
-[EeveeDownload] AUDIO-CONVERT ogg->m4a channels=2 sampleRate=44100 expectedFrames=0 source=...
+[EeveeDownload] AUDIO-CONVERT ogg->m4a channels=2 sampleRate=44100 decodedFrames=<n> source=...
 ```
 
 If there are no `AUDIO-KEY-CAPTURE` lines, the hook was not activated or the app's playback does not call the hooked decryptor. Check `[INIT] Activated NativeAudioKeyGroup`, then `AUDIO-KEY-CAPTURE hook active address=…`. If the hook is active but never fires, the playback may not have started, or the app build/layout differs from `9.1.70`.
 
-If the log shows `AUDIO-KEY-PROBE miss` for every key, the key belongs to a different file id/quality than the selected candidate. The safest fix is to let the app play the target track so the passive stream URL is captured, or add a per-candidate probe loop instead of picking the first resolvable candidate.
+If the log shows `AUDIO-KEY-PROBE miss` for every key on the first candidate, the app may be playing a different quality/file id. The downloader now tries every resolved candidate in rank order, so look for `AUDIO-KEY-PROBE trying candidate=… index=2/…` and a `match` on a later candidate. If every candidate misses, the captured key does not correspond to any file Spotify offered; play the target track again (to refresh the captured key/stream) and retry.
 
-On 9.1.70 passive capture is rare. If the log shows `AUDIO-FORMAT-PROBE skipped` or `candidates=[captured:UNKNOWN ...]`, the probe did not query TRACK_V4 metadata; try a different track or restart the app so the active resolver path runs.
+If the native key line reports `mode=2` (or any mode other than 1), the custom AES schedule at `object + 0x20` may not be the mode-2 cipher key. The probe result tells us whether it still works; if it does not, the next step is to inspect the mode-2 cipher object at `object + 0x338`.
+
+On 9.1.70 passive capture is rare. The active resolver now always runs, even when a passive stream exists, so the log should contain `AUDIO-FORMAT-PROBE candidates=[…]`. A `captured stream preferred; resolving metadata candidates as fallback` line confirms both paths are in play.
 
 ### 7.1 Probe results (on-device, 9.1.70)
 
@@ -525,14 +529,14 @@ Proceed with direct MP4 only if:
 
 If any condition fails, move to M4.
 
-### M4 implementation outline
+### M4 implementation (this change)
 
-- Keep the decrypted Ogg as an intermediate while validating M2.5; it is **not** the final Local Files format.
-- Embed a small Vorbis decoder (libogg + libvorbis, or a small equivalent) in `Sources/EeveeSpotifyC`.
-- Decode Ogg pages → PCM.
-- Encode PCM → AAC in an `.m4a` container with `ExtAudioFile` / `AudioConverter` / `AVAssetWriter`.
-- Add metadata/artwork after playback works.
-- Do not embed desktop FFmpeg. Do not rename Ogg to `.m4a`; the scanner/player must see a real AAC/MP4 container.
+- The decrypted Ogg is an intermediate only; it is never published or indexed.
+- `Sources/EeveeSpotifyC/stb_vorbis.c` (single public-domain C file) decodes Ogg Vorbis to interleaved 16-bit PCM.
+- `EeveeOggDecoder` streams 4096-frame chunks instead of loading the track in memory.
+- `OggVorbisTranscoder` encodes PCM to AAC in an `.m4a` container with `ExtAudioFile` (256 kbps requested; encoder default on failure).
+- A failed transcode keeps a hidden `.debug/<name>.ogg` for diagnosis but still fails the download; it never renames Ogg to `.m4a` or publishes an `.ogg`.
+- Metadata/artwork remains M6 polish.
 
 ---
 

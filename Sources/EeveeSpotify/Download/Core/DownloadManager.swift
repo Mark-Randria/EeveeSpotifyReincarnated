@@ -359,10 +359,10 @@ final class DownloadManager {
                     break
                 }
                 catch let error as SpotifyCDNClient.CDNError {
-                    // A stale captured URL and a key/quality mismatch should
-                    // both fall through to the next freshly resolved candidate.
-                    // A conversion failure is specific to the bytes we already
-                    // matched, so it propagates.
+                    // A stale captured URL, a key/quality mismatch, or an
+                    // unusable container (e.g. a DRM MP4 or a failed transcode)
+                    // should fall through to the next freshly resolved
+                    // candidate instead of failing the whole download.
                     let shouldTryNext: Bool
                     switch error {
                     case .noValidAudioKey:
