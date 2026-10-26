@@ -205,29 +205,32 @@ final class DownloadManager {
                     candidates.append(SpotifyAudioFileCandidate(fileID: captured))
                 }
 
-                if candidates.isEmpty {
-                    DownloadLogger.shared.log("download attempt: resolving audio files for \(trackURI)")
-                    do {
-                        candidates = try await SpotifyAPIResolver.fetchAudioFiles(
-                            trackURI: trackURI,
-                            bearerToken: token,
-                            baseURL: capture.spClientBaseURL,
-                            clientToken: capture.clientToken,
-                            clientID: capture.clientID
-                        )
-                        DownloadLogger.shared.log(
-                            "AUDIO-FORMAT-PROBE track=\(trackURI) candidates=[\(candidates.map { $0.probeDescription }.joined(separator: " | "))]"
-                        )
-                    } catch let metadataError {
-                        DownloadLogger.shared.log(
-                            "download attempt: audio file resolve failed: \(metadataError.localizedDescription)"
-                        )
-                        lastActiveResolveError = metadataError
-                    }
-                } else {
-                    DownloadLogger.shared.log(
-                        "AUDIO-FORMAT-PROBE track=\(trackURI) candidates=[captured:\(candidates[0].probeDescription)]"
+                // Always ask metadata for the full candidate list. A captured
+                // file id stays first because it is the file the app is actually
+                // decrypting; the ranked metadata candidates are fallbacks when
+                // that id's CDN URL or quality no longer matches the live key.
+                DownloadLogger.shared.log("download attempt: resolving audio files for \(trackURI)")
+                do {
+                    let fetchedUnsorted = try await SpotifyAPIResolver.fetchAudioFiles(
+                        trackURI: trackURI,
+                        bearerToken: token,
+                        baseURL: capture.spClientBaseURL,
+                        clientToken: capture.clientToken,
+                        clientID: capture.clientID
                     )
+                    let fetched = fetchedUnsorted.sorted { $0.qualityRank > $1.qualityRank }
+                    for candidate in fetched
+                    where !candidates.contains(where: { $0.fileID == candidate.fileID }) {
+                        candidates.append(candidate)
+                    }
+                    DownloadLogger.shared.log(
+                        "AUDIO-FORMAT-PROBE track=\(trackURI) candidates=[\(candidates.map { $0.probeDescription }.joined(separator: " | "))]"
+                    )
+                } catch let metadataError {
+                    DownloadLogger.shared.log(
+                        "download attempt: audio file resolve failed: \(metadataError.localizedDescription)"
+                    )
+                    lastActiveResolveError = metadataError
                 }
 
                 // Resolve EVERY candidate. The first one is the preferred
@@ -365,6 +368,10 @@ final class DownloadManager {
                     switch error {
                     case .noValidAudioKey:
                         shouldTryNext = true
+                    case .invalidOutput:
+                        // E.g. a DRM-protected MP4: the next candidate may be a
+                        // decryptable Ogg stream.
+                        shouldTryNext = true
                     case .httpStatus(let code)
                         where code == 400 || code == 403 || code == 404 || code == 416:
                         shouldTryNext = true
@@ -417,8 +424,8 @@ final class DownloadManager {
 
     /// `trackIdentifier` is a Spotify URI like `spotify:track:XXXX`. Lane A may
     /// cache streams under either the base62 ID after the prefix OR the full raw
-    /// identifier string, so we try both, then fall back to the latest captured
-    /// stream (spike-friendly).
+    /// identifier string, so we try both. The most recent capture is only used
+    /// when its `trackGID` proves it belongs to this track.
     private func resolveStreamInfo(forTrackIdentifier trackIdentifier: String) -> AudioStreamCapture.AudioStream? {
         let capture = AudioStreamCapture.shared
         let components = trackIdentifier.components(separatedBy: ":")
@@ -448,6 +455,13 @@ final class DownloadManager {
         var name = "\(artist) - \(title)"
         name = name.components(separatedBy: forbidden).joined()
         name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Leave headroom for the longest staging suffix (".<ext>.tmp" and
+        // ".transcode.tmp") under the usual 255-byte filesystem component limit.
+        let maxCharacters = 180
+        if name.count > maxCharacters {
+            name = String(name.prefix(maxCharacters))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
         return name.isEmpty ? "Download" : name
     }
 

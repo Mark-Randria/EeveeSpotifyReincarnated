@@ -365,7 +365,10 @@ final class SpotifyCDNClient {
                     continuation.resume(throwing: CDNError.invalidOutput)
                     return
                 }
-                continuation.resume(returning: data)
+                // If the edge ignored Range and sent the whole object, keep only
+                // the probe prefix so key selection never decrypts a full track.
+                let prefix = data.count > length ? Data(data.prefix(length)) : data
+                continuation.resume(returning: prefix)
             }
             task.resume()
         }
@@ -537,6 +540,15 @@ final class SpotifyCDNClient {
             DownloadLogger.shared.log(
                 "AUDIO-FORMAT-PROBE mp4 brand=\(brand) drmMarkers=[\(drmMarkers.joined(separator: ","))] head=\(headerHex)"
             )
+            if !drmMarkers.isEmpty {
+                // A CENC/DRM MP4 starts with `ftyp` but is not playable as a
+                // Local File. Fall through to the Ogg candidates instead of
+                // publishing a corrupt `.m4a`.
+                DownloadLogger.shared.log(
+                    "AUDIO-FORMAT-PROBE mp4 rejected drmMarkers=[\(drmMarkers.joined(separator: ","))]"
+                )
+                throw CDNError.invalidOutput
+            }
         case .ogg:
             let codec: String
             if head.range(of: Data("OpusHead".utf8)) != nil {
