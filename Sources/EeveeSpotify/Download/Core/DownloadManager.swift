@@ -33,7 +33,10 @@ final class DownloadManager {
     /// `eevee.log` file (and any interrupted `.tmp` staging file) would be
     /// listed as a download.
     private static let publishedAudioExtensions: Set<String> = [
-        "m4a", "mp4", "mp3", "flac", "ogg", "aac", "opus"
+        // Ogg/Opus are deliberately absent: the pipeline transcodes Ogg Vorbis
+        // to AAC/M4A before publishing (Spotify Local Files on iOS does not
+        // scan `.ogg`), so an `.ogg` on disk is only an intermediate artifact.
+        "m4a", "mp4", "mp3", "flac", "aac"
     ]
 
     private let queue = DispatchQueue(label: "com.eevee.downloads", qos: .utility)
@@ -162,7 +165,15 @@ final class DownloadManager {
             // 1) Prefer a passively captured stream (key + url from the app's
             //    own playplay/storage-resolve traffic).
             var stream = resolveStreamInfo(forTrackIdentifier: track.identifier)
+            // Every URL that may belong to this track, in preference order. The
+            // CDN client probes each one with the captured native key(s), so a
+            // key/quality mismatch on the first candidate falls through to the
+            // next instead of failing the whole download.
+            var downloadCandidates: [(url: URL, key: Data, label: String)] = []
             if let stream = stream {
+                downloadCandidates.append(
+                    (url: stream.url, key: stream.key, label: "captured:\(stream.trackGID)")
+                )
                 DownloadLogger.shared.log(
                     "download attempt: using captured stream gid=\(stream.trackGID) cdn=\(stream.url.absoluteString)"
                 )
@@ -186,9 +197,8 @@ final class DownloadManager {
 
                 // Candidates known passively (rare on 9.1.70) come first;
                 // otherwise resolve them actively from the track metadata.
-                // Phase 1 intentionally keeps the existing "first resolvable
-                // file" selection so the probe does not change which bytes are
-                // downloaded — it only records what Spotify offered.
+                // All resolvable candidates are retained: the native-key probe
+                // picks the one whose bytes the app actually decrypted.
                 var candidates: [SpotifyAudioFileCandidate] = []
                 if let captured = capture.fileID(forTrackGID: rawID)
                     ?? capture.fileID(forTrackGID: trackID) {
@@ -220,17 +230,15 @@ final class DownloadManager {
                     )
                 }
 
-                // Resolve EVERY candidate for the probe, but keep the existing
-                // selection rule: the first candidate in response order that
-                // yields a key + CDN URL is the one downloaded. The extra
-                // playplay/storage-resolve calls tell us whether Spotify issues
-                // keys for MP4/AAC file ids at all, without downloading their
-                // bytes. Phase 2A can then rank the resolvable candidates.
-                var firstResolved: (
+                // Resolve EVERY candidate. The first one is the preferred
+                // download, but each resolved candidate is retained so the
+                // native-key probe can fall through when the app's playback
+                // quality/file id differs from the first offered format.
+                var resolvedStreams: [(
                     candidate: SpotifyAudioFileCandidate,
                     key: Data,
                     url: URL
-                )?
+                )] = []
                 for candidate in candidates {
                     let fileId = candidate.fileID
                     DownloadLogger.shared.log(
@@ -250,13 +258,20 @@ final class DownloadManager {
                         DownloadLogger.shared.log(
                             "AUDIO-FORMAT-PROBE resolvable fileId=\(fileId) format=\(candidate.formatName) key=\(key.count)B cdnExt=\(cdnExtension) cdnHost=\(cdnURL.host ?? "?")"
                         )
-                        if firstResolved == nil {
-                            firstResolved = (
+                        resolvedStreams.append(
+                            (
                                 candidate: candidate,
                                 key: key,
                                 url: cdnURL
                             )
-                        }
+                        )
+                        downloadCandidates.append(
+                            (
+                                url: cdnURL,
+                                key: key,
+                                label: "\(fileId):\(candidate.formatName)"
+                            )
+                        )
                     } catch let resolveError {
                         DownloadLogger.shared.log(
                             "AUDIO-FORMAT-PROBE unavailable fileId=\(fileId) format=\(candidate.formatName) error=\(DownloadManager.describe(resolveError))"
@@ -265,7 +280,7 @@ final class DownloadManager {
                     }
                 }
 
-                if let resolved = firstResolved {
+                if let resolved = resolvedStreams.first {
                     DownloadLogger.shared.log(
                         "AUDIO-FORMAT-PROBE selected fileId=\(resolved.candidate.fileID) format=\(resolved.candidate.formatName) hint=\(resolved.candidate.containerHint) rank=\(resolved.candidate.qualityRank)"
                     )
@@ -291,10 +306,15 @@ final class DownloadManager {
             }
 
             let nativeKeys = NativeAudioKeyCapture.shared.candidateKeys()
-            let playplayHex = stream.key.map { String(format: "%02x", $0) }.joined()
             DownloadLogger.shared.log(
-                "AUDIO-KEY-CAPTURE candidates=\(nativeKeys.count) playplay=\(playplayHex)"
+                "AUDIO-KEY-CAPTURE candidates=\(nativeKeys.count) downloadCandidates=\(downloadCandidates.count)"
             )
+            for candidate in downloadCandidates {
+                let playplayHex = candidate.key.map { String(format: "%02x", $0) }.joined()
+                DownloadLogger.shared.log(
+                    "AUDIO-KEY-CAPTURE candidate=\(candidate.label) playplay=\(playplayHex)"
+                )
+            }
 
             guard !nativeKeys.isEmpty else {
                 DownloadLogger.shared.log(
@@ -304,21 +324,53 @@ final class DownloadManager {
                 return
             }
 
+            guard !downloadCandidates.isEmpty else {
+                setState(.failed("No audio stream captured for this track yet — play it first"))
+                return
+            }
+
             let fileName = DownloadManager.sanitizedFileName(
                 artist: track.artist,
                 title: track.title
             )
             let directory = try downloadsDirectory()
 
-            let finalURL = try await cdnClient.downloadEncryptedStream(
-                url: stream.url,
-                keys: nativeKeys,
-                to: directory,
-                fileName: fileName,
-                progress: { [weak self] progress in
-                    self?.setState(.downloading(progress))
+            // Each candidate gets its own 8 KiB key probe. A wrong key/quality
+            // mismatch is cheap; only the candidate whose file actually matches
+            // a captured native key is downloaded in full.
+            var downloadedURL: URL?
+            var lastDownloadError: Error?
+            for (index, candidate) in downloadCandidates.enumerated() {
+                DownloadLogger.shared.log(
+                    "AUDIO-KEY-PROBE trying candidate=\(candidate.label) index=\(index + 1)/\(downloadCandidates.count)"
+                )
+                do {
+                    downloadedURL = try await cdnClient.downloadEncryptedStream(
+                        url: candidate.url,
+                        keys: nativeKeys,
+                        to: directory,
+                        fileName: fileName,
+                        progress: { [weak self] progress in
+                            self?.setState(.downloading(progress))
+                        }
+                    )
+                    break
                 }
-            )
+                catch let error as SpotifyCDNClient.CDNError {
+                    if case .noValidAudioKey = error, index + 1 < downloadCandidates.count {
+                        DownloadLogger.shared.log(
+                            "AUDIO-KEY-PROBE candidate \(candidate.label) did not match a captured key; trying next"
+                        )
+                        lastDownloadError = error
+                        continue
+                    }
+                    throw error
+                }
+            }
+
+            guard let finalURL = downloadedURL else {
+                throw lastDownloadError ?? SpotifyCDNClient.CDNError.noValidAudioKey
+            }
 
             let attributes = try? fileManager.attributesOfItem(atPath: finalURL.path)
             let size = (attributes?[.size] as? NSNumber)?.int64Value ?? 0

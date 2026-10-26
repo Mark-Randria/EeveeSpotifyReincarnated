@@ -239,12 +239,52 @@ final class SpotifyCDNClient {
                 }
             }
 
+            // `.ogg` is not accepted by Spotify's Local Files scanner and has no
+            // native Local Files playback path. Transcode the decrypted Vorbis
+            // stream to AAC in a real MP4 container before publishing. The Ogg is
+            // only an intermediate; it is removed after a successful transcode.
+            var finalContainer = detected.container
+            if detected.container == .ogg {
+                let sourceForTranscode = publishURL
+                let transcodedURL = outputDirectory
+                    .appendingPathComponent(".\(fileName).transcode.tmp")
+                try? fileManager.removeItem(at: transcodedURL)
+                do {
+                    try OggVorbisTranscoder.transcodeToM4A(
+                        source: sourceForTranscode,
+                        destination: transcodedURL
+                    )
+                    try? fileManager.removeItem(at: sourceForTranscode)
+                    publishURL = transcodedURL
+                    finalContainer = .mp4
+                }
+                catch {
+                    // Keep a hidden copy so a failed decode can be diagnosed
+                    // without ever exposing an `.ogg` to the scanner.
+                    let debugDirectory = outputDirectory
+                        .appendingPathComponent(".debug", isDirectory: true)
+                    try? fileManager.createDirectory(
+                        at: debugDirectory,
+                        withIntermediateDirectories: true
+                    )
+                    let debugURL = debugDirectory
+                        .appendingPathComponent("\(fileName).ogg")
+                    try? fileManager.removeItem(at: debugURL)
+                    try? fileManager.copyItem(at: sourceForTranscode, to: debugURL)
+                    DownloadLogger.shared.log(
+                        "AUDIO-CONVERT failed: \(error.localizedDescription) debug=\(debugURL.lastPathComponent)"
+                    )
+                    try? fileManager.removeItem(at: transcodedURL)
+                    throw error
+                }
+            }
+
             let finalURL = outputDirectory
                 .appendingPathComponent(fileName, isDirectory: false)
-                .appendingPathExtension(detected.container.fileExtension)
+                .appendingPathExtension(finalContainer.fileExtension)
 
             DownloadLogger.shared.log(
-                "AUDIO-FORMAT-PROBE container=\(detected.container.rawValue) urlExt=\(url.pathExtension.isEmpty ? "<none>" : url.pathExtension) stagedExt=\(urlExtension) final=\(finalURL.lastPathComponent)"
+                "AUDIO-FORMAT-PROBE container=\(detected.container.rawValue) urlExt=\(url.pathExtension.isEmpty ? "<none>" : url.pathExtension) stagedExt=\(urlExtension) final=\(finalURL.lastPathComponent) finalContainer=\(finalContainer.rawValue)"
             )
 
             do {

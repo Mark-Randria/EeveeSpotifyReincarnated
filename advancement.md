@@ -1,7 +1,7 @@
 # Advancement — In-App Offline Downloader via Spotify Local Files
 
-**Status:** playplay + storage-resolve confirmed live on-device; native 9.1.70 AES key capture and multi-key CDN probe implemented; rebuild and on-device decryption retest pending
-**Date:** 2026-10-23
+**Status:** playplay + storage-resolve confirmed live on-device; native 9.1.70 AES key capture, multi-key CDN probe, and Ogg Vorbis -> AAC/M4A transcode implemented; rebuild and on-device end-to-end retest pending
+**Date:** 2026-10-26
 **Branch:** `feat/download-impl`
 **Target:** Spotify `9.1.70` (`ipa_original/Spotify_9.1.70.ipa`)
 **Accepted UX:** the downloaded song appears under Spotify's **Local Files** and plays offline in the Spotify player. It does **not** replace the original Spotify track row.
@@ -381,6 +381,23 @@ Changed files:
   - Detects the 167-byte Ogg prefix and strips it before publishing.
   - Logs `AUDIO-KEY-PROBE match|miss key=… head=…` and `AUDIO-KEY-PROBE selected …`.
 
+### 6.6 Ogg Vorbis -> AAC/M4A transcode (this change)
+
+Spotify's Local Files scanner on iOS accepts `.m4a`/`.mp4` but not `.ogg`, so the decrypted Ogg is now only an intermediate:
+
+- `Sources/EeveeSpotifyC/stb_vorbis.c` — vendored public-domain Ogg Vorbis decoder (single file).
+- `Sources/EeveeSpotifyC/EeveeOggDecoder.c` + `include/EeveeOggDecoder.h` — small streaming wrapper (`Open`/`Read`/`Close`). The implementation is compiled from `stb_vorbis.c` once; the wrapper includes it with `STB_VORBIS_HEADER_ONLY` to get declarations only.
+- `Sources/EeveeSpotify/Download/Core/OggVorbisTranscoder.swift` — decodes interleaved 16-bit PCM in 4096-frame chunks and feeds `ExtAudioFile`/AudioToolbox (`kAudioFileM4AType`, `kAudioFormatMPEG4AAC`) to produce a real `.m4a`. It requests 256 kbps and falls back to the encoder default if that property is rejected.
+- `SpotifyCDNClient` now:
+  1. strips the 167-byte Ogg prefix,
+  2. transcodes the Ogg to a hidden `.transcode.tmp`,
+  3. deletes the Ogg intermediate,
+  4. publishes the `.m4a`.
+  If the transcode fails, a hidden copy is kept under `Documents/EeveeSpotifyDownloads/.debug/<name>.ogg` for diagnosis, but no `.ogg` is published or indexed.
+- `DownloadManager.publishedAudioExtensions` no longer includes `ogg`/`opus`, so an interrupted intermediate can never appear as a Local Files download.
+
+The C wrapper was compiled and exercised on the host with a standard Vorbis file (44.1 kHz stereo, 269188 frames decoded) before committing; the Swift/AudioToolbox side still requires the iOS cloud build.
+
 ---
 
 ## 7. How to run the Phase 1 probe
@@ -414,9 +431,11 @@ Expected log shape:
 [EeveeDownload] AUDIO-KEY-CAPTURE candidates=1 playplay=<32 hex>
 [EeveeDownload] AUDIO-KEY-PROBE match key=<32 hex> container=ogg offset=167 head=...
 [EeveeDownload] AUDIO-KEY-PROBE selected container=ogg offset=167 probe=8192B
-[EeveeDownload] AUDIO-FORMAT-PROBE container=ogg urlExt=<none> stagedExt=ogg final=Artist - Title.ogg
+[EeveeDownload] AUDIO-FORMAT-PROBE container=ogg urlExt=<none> stagedExt=ogg final=Artist - Title.m4a finalContainer=mp4
 [EeveeDownload] AUDIO-FORMAT-PROBE stripped ogg prefix bytes=167
 [EeveeDownload] AUDIO-FORMAT-PROBE ogg codec=vorbis magicOffset=167 head=4f676753...
+[EeveeDownload] AUDIO-CONVERT start ogg->m4a channels=2 sampleRate=44100 source=...
+[EeveeDownload] AUDIO-CONVERT ogg->m4a channels=2 sampleRate=44100 expectedFrames=0 source=...
 ```
 
 If there are no `AUDIO-KEY-CAPTURE` lines, the hook was not activated or the app's playback does not call the hooked decryptor. Check `[INIT] Activated NativeAudioKeyGroup`, then `AUDIO-KEY-CAPTURE hook active address=…`. If the hook is active but never fires, the playback may not have started, or the app build/layout differs from `9.1.70`.
@@ -468,7 +487,7 @@ On 9.1.70 passive capture is rare. If the log shows `AUDIO-FORMAT-PROBE skipped`
 | **M2 — On-device probe** | Done | Candidate list captured; playplay 400 fixed; all Ogg candidates resolvable; storage-resolve + CDN download confirmed |
 | **M2.5 — Native key + decryption** | In progress | Hook captures the 9.1.70 native AES key; multi-key probe selects it; decrypted bytes contain `OggS`; 167-byte prefix stripped |
 | **M3 — Direct MP4 path** | Not applicable (no MP4 offered) | If a future track offers MP4 and it is playable: rank MP4 first, output `.m4a`, verify offline playback. Tested tracks offered no MP4, so M4 is the path |
-| **M4 — Ogg → AAC/M4A transcode** | Pending | If MP4 is unavailable/DRM: Ogg 320 decodes and encodes to `.m4a`; duration/seek correct |
+| **M4 — Ogg → AAC/M4A transcode** | Implemented in source; retest pending | stb_vorbis decode + AudioToolbox AAC/M4A encode is wired into the publish path; verify duration/seek on-device |
 | **M5 — Local Files verification** | Pending | Track appears under Local Files and plays in airplane mode after relaunch |
 | **M6 — Polish and app-only hardening** | Pending | Metadata/artwork, retry/cancel, duplicate handling, file sharing disabled, storage cleanup |
 
@@ -486,6 +505,13 @@ On 9.1.70 passive capture is rare. If the log shows `AUDIO-FORMAT-PROBE skipped`
 - Pressing Download produces `AUDIO-KEY-PROBE match … offset=167` (or `offset=0`) and `AUDIO-KEY-PROBE selected …`.
 - The decrypted staging file contains `OggS` at the detected offset and is stripped to start with `OggS`.
 - The resulting Ogg can be inspected/replayed locally before the M4 transcode.
+
+### M4 acceptance detail
+
+- `AUDIO-CONVERT start` and `AUDIO-CONVERT ogg->m4a` lines appear for an Ogg download.
+- The final file has an `.m4a` extension and an MP4 `ftyp` header (not `OggS`).
+- The transcode does not leave a top-level `.ogg`; only the hidden `.debug/` copy may remain if encoding failed.
+- The `.m4a` duration matches the track and seeking works after Local Files scans it.
 
 ### M3 go/no-go
 
@@ -521,8 +547,8 @@ If any condition fails, move to M4.
 7. **`storage-resolve` product/path parameter.** The current request uses `product=0` and the interactive audio path. MP4/EME files may require a different product or path; an `unavailable` MP4 result is not proof that the file is globally unavailable.
 8. **No build/test in this workspace.** The source changes are not compiled; the next real gate is the macOS build and the on-device probe.
 9. **Hook address/version coupling.** `0x1069101a0` and the `object + 0x20` layout are specific to the 9.1.70 IPA. The hook checks the version prefix and the function prologue before patching; a different build must be re-analyzed rather than reused.
-10. **Key/file-id association.** The app may prefetch the next track's key. The multi-key probe rejects wrong keys, but the selected CDN file must be a file the app has actually decrypted. Preferring the app's captured stream URL avoids this; otherwise the first resolvable candidate may be a different quality than the playback.
-11. **Transcoder licensing/size.** libogg/libvorbis are permissive and small, but still need an iOS build and integration. The `.m4a` encoder can use system AudioToolbox, keeping binary growth modest.
+10. **Key/file-id association.** The app may prefetch the next track's key. The multi-key probe rejects wrong keys, and the downloader now iterates every resolved candidate (not just the first) so a playback-quality mismatch falls through. Preferring the app's captured stream URL remains the strongest guarantee.
+11. **Transcoder size/CPU.** stb_vorbis is a single ~188 KB public-domain C file and AudioToolbox supplies the AAC encoder, so binary growth is modest. Decoding+encoding a full track costs CPU time; it runs off the main thread and is not cancellable mid-transcode yet. stb_vorbis does not support old floor-0 Vorbis files, but Spotify's streams use floor 1.
 12. **Personal-use/ToS risk.** This is an in-app personal downloader; do not distribute downloaded content.
 
 ---
@@ -547,3 +573,4 @@ If any condition fails, move to M4.
 | 2026-10-22 | Phase 1 source changes: `AudioFile.format` parsing, candidate resolution logging, container sniffing, reconcile filter |
 | 2026-10-23 | On-device probe recorded: no MP4 offered; all playplay calls 400. Root-caused the 400 to a malformed `PlayPlayLicenseRequest` body (one dropped token byte + invalid timestamp varint). Corrected `SpotifyAPIResolver.playplayRequestBody`; retest pending. |
 | 2026-10-23 | On-device retest: all four candidates resolvable; storage-resolve and CDN download succeed; decryption with the obfuscated playplay key produces random bytes. Added `NativeAudioKeyCapture` + Orion `NativeAudioKeyHook` at `0x1069101a0`; key schedule is at `object + 0x20`. Added multi-key Range probe and 167-byte Ogg prefix stripping to `SpotifyCDNClient`; retest pending. |
+| 2026-10-26 | Added the `.ogg` → AAC `.m4a` publish path: vendored `stb_vorbis.c`, added the `EeveeOggDecoder` C wrapper, and implemented `OggVorbisTranscoder` with AudioToolbox `ExtAudioFile`. The C decoder was built and exercised on the host (44.1 kHz stereo sample, 269188 frames). Ogg/Opus removed from the published-extension allowlist; failed transcodes keep a hidden `.debug` Ogg. Cloud rebuild and on-device test pending. |
