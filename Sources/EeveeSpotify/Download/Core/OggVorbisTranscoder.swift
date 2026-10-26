@@ -23,6 +23,7 @@ enum OggVorbisTranscoder {
         case configureFile(OSStatus)
         case decodeFailed(Int32)
         case encodeFailed(OSStatus)
+        case emptyStream
 
         var errorDescription: String? {
             switch self {
@@ -38,6 +39,8 @@ enum OggVorbisTranscoder {
                 return "Ogg Vorbis decode failed (stb_vorbis error \(code))"
             case .encodeFailed(let status):
                 return "AAC encode failed (OSStatus \(status))"
+            case .emptyStream:
+                return "Ogg Vorbis stream contained no decodable audio frames"
             }
         }
     }
@@ -141,6 +144,7 @@ enum OggVorbisTranscoder {
         let framesPerChunk: Int32 = 4096
         let samplesPerChunk = Int(framesPerChunk) * Int(channels)
         var pcm = [Int16](repeating: 0, count: samplesPerChunk)
+        var decodedFrames: Int64 = 0
 
         while true {
             var decodeError: Int32 = 0
@@ -153,6 +157,7 @@ enum OggVorbisTranscoder {
             if frames <= 0 {
                 break
             }
+            decodedFrames += Int64(frames)
 
             let byteCount = UInt32(Int(frames) * Int(channels) * MemoryLayout<Int16>.size)
             var bufferList = AudioBufferList(
@@ -174,8 +179,12 @@ enum OggVorbisTranscoder {
             }
         }
 
+        guard decodedFrames > 0 else {
+            throw TranscodeError.emptyStream
+        }
+
         DownloadLogger.shared.log(
-            "AUDIO-CONVERT ogg->m4a channels=\(channels) sampleRate=\(sampleRate) expectedFrames=\(totalFrames) source=\(source.lastPathComponent)"
+            "AUDIO-CONVERT ogg->m4a channels=\(channels) sampleRate=\(sampleRate) decodedFrames=\(decodedFrames) source=\(source.lastPathComponent)"
         )
     }
 }
