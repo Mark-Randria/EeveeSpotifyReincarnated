@@ -72,27 +72,63 @@ final class NativeAudioKeyCapture {
     /// prologue is read. Find the image named `Spotify` instead.
     static func runtimeDecryptFunctionAddress() -> UnsafeMutableRawPointer? {
         guard let imageIndex = spotifyImageIndex() else {
+            DownloadLogger.shared.log("AUDIO-KEY-RESOLVE no Spotify image loaded")
             return nil
         }
         let slide = _dyld_get_image_vmaddr_slide(imageIndex)
+        let slideHex = String(UInt64(bitPattern: Int64(slide)), radix: 16)
         let runtimeAddress = decryptFunctionFileAddress &+ UInt64(bitPattern: Int64(slide))
         guard let pointer = UnsafeMutableRawPointer(bitPattern: UInt(runtimeAddress)) else {
+            DownloadLogger.shared.log("AUDIO-KEY-RESOLVE bad pointer image=\(imageIndex) slide=0x\(slideHex)")
             return nil
         }
 
-        // Never dereference a pointer that is not inside a loaded image. This
-        // makes a wrong slide or a changed binary fail closed instead of
-        // segfaulting during dyld initializers.
+        // Never dereference the pointer directly. mach_vm_read_overwrite returns
+        // KERN_INVALID_ADDRESS for unmapped memory instead of raising SIGSEGV,
+        // so even a wrong slide or a changed image layout fails closed.
         var imageInfo = Dl_info()
         guard dladdr(pointer, &imageInfo) != 0 else {
+            DownloadLogger.shared.log(
+                "AUDIO-KEY-RESOLVE unmapped image=\(imageIndex) slide=0x\(slideHex) addr=0x\(String(runtimeAddress, radix: 16))"
+            )
             return nil
         }
 
-        let bytes = pointer.assumingMemoryBound(to: UInt8.self)
-        for (offset, expected) in expectedPrologue.enumerated() where bytes[offset] != expected {
+        guard let prologue = readBytes(at: pointer, count: expectedPrologue.count),
+              prologue == expectedPrologue else {
+            DownloadLogger.shared.log(
+                "AUDIO-KEY-RESOLVE prologue mismatch image=\(imageIndex) slide=0x\(slideHex) addr=0x\(String(runtimeAddress, radix: 16))"
+            )
             return nil
         }
+
+        DownloadLogger.shared.log(
+            "AUDIO-KEY-RESOLVE ok image=\(imageIndex) slide=0x\(slideHex) addr=0x\(String(runtimeAddress, radix: 16))"
+        )
         return pointer
+    }
+
+    /// Reads memory without faulting. Unlike `pointer.pointee`, a failed
+    /// `mach_vm_read_overwrite` is an error code, not a SIGSEGV.
+    private static func readBytes(at pointer: UnsafeMutableRawPointer, count: Int) -> [UInt8]? {
+        guard count > 0 else { return [] }
+        let buffer = UnsafeMutableRawPointer.allocate(byteCount: count, alignment: 1)
+        defer { buffer.deallocate() }
+        var outSize: mach_vm_size_t = 0
+        let result = mach_vm_read_overwrite(
+            mach_task_self_,
+            mach_vm_address_t(UInt(bitPattern: pointer)),
+            mach_vm_size_t(count),
+            mach_vm_address_t(UInt(bitPattern: buffer)),
+            &outSize
+        )
+        guard result == KERN_SUCCESS, outSize == mach_vm_size_t(count) else {
+            return nil
+        }
+        return Array(UnsafeBufferPointer(
+            start: buffer.assumingMemoryBound(to: UInt8.self),
+            count: count
+        ))
     }
 
     /// Index of the loaded Spotify executable, independent of which image is

@@ -441,11 +441,20 @@ struct EeveeSpotify: Tweak {
             // Capture the already-deobfuscated AES key from Spotify's own
             // 9.1.70 audio decryptor. This is what makes CDN downloads
             // decryptable without reimplementing the PlayPlay key VM.
-            if NativeAudioKeyCapture.shared.isSupported {
-                NativeAudioKeyGroup().activate()
-                writeDebugLog("[INIT] Activated NativeAudioKeyGroup")
-            } else {
-                writeDebugLog("[INIT] Skipped NativeAudioKeyGroup (unsupported Spotify build/address)")
+            //
+            // Do NOT resolve the Spotify address or install this hook during
+            // dyld/Tweak init. Under LiveContainer the tweak is initialized
+            // while the guest image is still being loaded, and an early address
+            // probe used to abort launch before the app could start. Defer to
+            // the main run loop; if the layout is wrong we skip the hook and
+            // the app still launches.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                if NativeAudioKeyCapture.shared.isSupported {
+                    NativeAudioKeyGroup().activate()
+                    writeDebugLog("[INIT] Activated NativeAudioKeyGroup (deferred)")
+                } else {
+                    writeDebugLog("[INIT] Skipped NativeAudioKeyGroup (unsupported Spotify build/address)")
+                }
             }
 
             NSLog("[EeveeSpotify] Initialization complete for 9.1.x")
