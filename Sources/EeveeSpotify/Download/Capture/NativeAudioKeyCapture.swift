@@ -1,4 +1,5 @@
 import Darwin
+import EeveeSpotifyC
 import Foundation
 import MachO
 
@@ -114,15 +115,14 @@ final class NativeAudioKeyCapture {
         guard count > 0 else { return [] }
         let buffer = UnsafeMutableRawPointer.allocate(byteCount: count, alignment: 1)
         defer { buffer.deallocate() }
-        var outSize: mach_vm_size_t = 0
-        let result = mach_vm_read_overwrite(
-            mach_task_self_,
-            mach_vm_address_t(UInt(bitPattern: pointer)),
-            mach_vm_size_t(count),
-            mach_vm_address_t(UInt(bitPattern: buffer)),
+        var outSize: UInt64 = 0
+        let result = EeveeReadMemory(
+            UInt64(UInt(bitPattern: pointer)),
+            UInt64(count),
+            buffer,
             &outSize
         )
-        guard result == KERN_SUCCESS, outSize == mach_vm_size_t(count) else {
+        guard result == 0, outSize == UInt64(count) else {
             return nil
         }
         return Array(UnsafeBufferPointer(
