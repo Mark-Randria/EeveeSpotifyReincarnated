@@ -3,35 +3,49 @@ import EeveeSpotifyC
 import Foundation
 import MachO
 
-/// Captures the AES-128 key that Spotify's own audio decryptor uses for the
+/// Recovers the AES-128 key that Spotify's own audio pipeline uses for the
 /// track currently being played.
 ///
-/// Spotify 9.1.70 does not use CommonCrypto for audio. It ships a custom
-/// AES-CTR implementation:
+/// The key returned by `/playplay/v1/key/{fileId}` is **not** the AES key: it
+/// is obfuscated and then bound to the audio file id by Spotify's PlayPlay
+/// white box (`unplayplay::decrypt_and_bind_key`). Reimplementing that is a
+/// moving target, and patching the decrypt entry is fatal under
+/// LiveContainer/iOS 26 (Orion leaves the patched `__TEXT` page `rw-` and the
+/// code-signing monitor kills the process with `CODESIGNING "Invalid Page"`).
 ///
-///   - fixed CTR IV at `0x109afe750`
-///   - AES T-tables at `0x109afe760`
-///   - decrypt entry at `0x1069101a0(object, streamOffset, out, in, length)`
+/// The app, however, stores the finished key in plaintext inside its live
+/// audio player object. Recovered layout (from the key setter at
+/// `0x100e67d90` and the decrypt-entry callers at `0x101ccc3e4` /
+/// `0x102cd86c8`):
 ///
-/// The decryptor object layout (verified by disassembling the entry point and
-/// the AES block routine) is:
+///   struct Player {
+///       ...
+///       void    *inner;        // +0x78 -> object embedding the decryptor
+///       ...
+///       uint8_t  key[28];      // +0x564 (first 16 bytes are the AES-128 key)
+///       ...
+///       uint8_t  mode;         // +0x580
+///   };
 ///
-///   +0x00  mode flag
-///   +0x10  16-byte CTR counter block (input to AES)
-///   +0x20  176-byte AES-128 key schedule; the first 16 bytes are the key
-///   +0x2f8 16-byte keystream output buffer
-///   +0x308 current block index
-///   +0x330 second CTR context (counter + keystream cache)
+///   struct Inner {             // *inner
+///       ...
+///       uint8_t  decryptor[0x370];   // +0x78
+///       ...
+///   };
 ///
-/// The playplay response gives us an *obfuscated* key, and deobfuscating it
-/// depends on Spotify's current PlayPlay VM/token. Rather than reimplementing a
-/// moving target, capture the already-deobfuscated schedule from the app's own
-/// decryptor and reuse the first 16 bytes. This is the same key the app uses to
-/// play the track, so it is exactly the key needed for its CDN download.
+/// After `setKey()` ran, the embedded decryptor header is mode `0`/`1` at
+/// +0x00 and has-key `1` at +0x08. `EeveeScanPlayerAudioKeys` walks writable
+/// memory for that signature and returns the keys it finds; the download path
+/// then checks each one against the encrypted CDN prefix, so a stale key from
+/// another track is discarded automatically.
+///
+/// Capture is a read-only memory scan; no code page is ever written.
 final class NativeAudioKeyCapture {
     static let shared = NativeAudioKeyCapture()
 
-    /// File (unslid) VA of the 9.1.70 custom audio decrypt entry.
+    /// File (unslid) VA of the 9.1.70 custom audio decrypt entry. Used only as
+    /// a layout gate so the player-struct offsets are not trusted on another
+    /// build. The scan never calls or patches this address.
     static let decryptFunctionFileAddress: UInt64 = 0x1069101a0
 
     /// Expected prologue at `decryptFunctionFileAddress`:
@@ -46,25 +60,104 @@ final class NativeAudioKeyCapture {
         0xF6, 0x57, 0x03, 0xA9,
     ]
 
+    /// Bounds the scan so a download tap cannot pin a CPU core indefinitely.
+    /// The app's writable footprint is well under this on an iPhone 11.
+    private static let scanByteBudget: UInt64 = 384 * 1024 * 1024
+    private static let scanTimeBudget: UInt64 = 6_000
+    private static let maxKeys = 16
+
     private let lock = NSLock()
-    /// Most recent last; bounded so a long session cannot grow without limit.
-    private var capturedKeys: [Data] = []
-    private let maxCapturedKeys = 16
+    /// Newest first. Bounded so a long session cannot grow without limit.
+    private var knownKeys: [Data] = []
 
     private init() {}
 
-    /// The hook is only safe when the exact 9.1.70 binary layout is present.
-    var isSupported: Bool {
-        guard let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String,
-              version.hasPrefix("9.1.70") else {
-            return false
+    /// Scans process memory for live player objects and returns the candidate
+    /// AES-128 keys, newest scan first.
+    ///
+    /// Blocking: call from a background queue. This is read-only, so it is safe
+    /// while audio is playing and does not interfere with code signing.
+    func scanForKeys() -> [Data] {
+        let layoutMatches = Self.runtimeDecryptFunctionAddress() != nil
+        if !layoutMatches {
+            DownloadLogger.shared.log(
+                "AUDIO-KEY-SCAN unsupported layout — decrypt entry not found; scanning anyway"
+            )
         }
-        return Self.runtimeDecryptFunctionAddress() != nil
+
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        var rawKeys = [UInt8](repeating: 0, count: Self.maxKeys * 16)
+        var keyCount: UInt32 = 0
+        var scannedBytes: UInt64 = 0
+        var regionCount: UInt32 = 0
+        var candidateCount: UInt32 = 0
+
+        let status: Int32 = rawKeys.withUnsafeMutableBufferPointer { buffer in
+            EeveeScanPlayerAudioKeys(
+                Self.scanByteBudget,
+                Self.scanTimeBudget,
+                buffer.baseAddress,
+                UInt32(Self.maxKeys),
+                &keyCount,
+                &scannedBytes,
+                &regionCount,
+                &candidateCount
+            )
+        }
+
+        let elapsed = CFAbsoluteTimeGetCurrent() - startedAt
+        let elapsedText = String(format: "%.2f", elapsed)
+
+        guard status == 0 else {
+            DownloadLogger.shared.log(
+                "AUDIO-KEY-SCAN failed status=\(status) scanned=\(scannedBytes)B regions=\(regionCount) candidates=\(candidateCount) elapsed=\(elapsedText)s"
+            )
+            return latestKeys()
+        }
+
+        var found: [Data] = []
+        found.reserveCapacity(Int(keyCount))
+        for index in 0..<Int(keyCount) {
+            let start = index * 16
+            found.append(Data(rawKeys[start ..< start + 16]))
+        }
+
+        lock.lock()
+        // Newest scan first; drop duplicates against keys seen earlier.
+        var merged = found
+        for old in knownKeys where !merged.contains(old) {
+            merged.append(old)
+        }
+        if merged.count > Self.maxKeys {
+            merged.removeLast(merged.count - Self.maxKeys)
+        }
+        knownKeys = merged
+        lock.unlock()
+
+        let hex = found.map { $0.map { String(format: "%02x", $0) }.joined() }
+        DownloadLogger.shared.log(
+            "AUDIO-KEY-SCAN status=ok regions=\(regionCount) scanned=\(scannedBytes)B candidates=\(candidateCount) elapsed=\(elapsedText)s keys=\(found.count) total=\(merged.count) values=\(hex)"
+        )
+        return merged
+    }
+
+    /// Keys already discovered without triggering a new scan.
+    func latestKeys() -> [Data] {
+        lock.lock()
+        let snapshot = knownKeys
+        lock.unlock()
+        return snapshot
+    }
+
+    func reset() {
+        lock.lock()
+        knownKeys.removeAll()
+        lock.unlock()
     }
 
     /// Resolves the unslid 9.1.70 address through the Spotify image's slide and
-    /// verifies the prologue before allowing Orion to patch it. If Spotify ever
-    /// ships a different binary, this returns nil and the hook is skipped.
+    /// verifies the prologue. Purely diagnostic: the key scan does not patch
+    /// this address. If Spotify ships a different binary the check fails closed.
     ///
     /// Do NOT use image index 0: under LiveContainer (and similar loaders) the
     /// main executable is the loader, so image 0's slide belongs to
@@ -143,53 +236,5 @@ final class NativeAudioKeyCapture {
             return index
         }
         return nil
-    }
-
-    /// Reads the AES-128 key from the key schedule of the live decryptor and
-    /// records it if it has not been seen before.
-    func capture(object: UnsafeMutableRawPointer) {
-        // object + 0x20 starts the AES key schedule, not the counter block at
-        // +0x10. The first 16 schedule bytes are the cipher key itself.
-        let keyPointer = object.advanced(by: 0x20).assumingMemoryBound(to: UInt8.self)
-        let key = Data(bytes: keyPointer, count: 16)
-
-        guard key.contains(where: { $0 != 0 }) else { return }
-
-        lock.lock()
-        if !capturedKeys.contains(key) {
-            capturedKeys.append(key)
-            if capturedKeys.count > maxCapturedKeys {
-                capturedKeys.removeFirst(capturedKeys.count - maxCapturedKeys)
-            }
-            let hex = key.map { String(format: "%02x", $0) }.joined()
-            let counter = Data(
-                bytes: object.advanced(by: 0x10).assumingMemoryBound(to: UInt8.self),
-                count: 16
-            )
-            let counterHex = counter.map { String(format: "%02x", $0) }.joined()
-            // Mode 1 uses the custom AES schedule directly; other modes use the
-            // alternate stream context at +0x330. Logging the flag lets the
-            // on-device run confirm which path the app actually takes.
-            let mode = object.assumingMemoryBound(to: UInt8.self).pointee
-            DownloadLogger.shared.log(
-                "AUDIO-KEY-CAPTURE native key=\(hex) counter=\(counterHex) mode=\(mode) total=\(capturedKeys.count)"
-            )
-        }
-        lock.unlock()
-    }
-
-    /// Candidate keys, newest first. The downloader probes each against the
-    /// first CDN bytes and keeps the one that produces a real container.
-    func candidateKeys() -> [Data] {
-        lock.lock()
-        let snapshot = capturedKeys
-        lock.unlock()
-        return Array(snapshot.reversed())
-    }
-
-    func reset() {
-        lock.lock()
-        capturedKeys.removeAll()
-        lock.unlock()
     }
 }

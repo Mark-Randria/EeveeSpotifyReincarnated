@@ -131,8 +131,9 @@ final class SpotifyCDNClient {
 
         // Pick the captured key BEFORE downloading the whole stream. The CDN
         // supports Range, so this is one 8 KiB request instead of a second
-        // full download. Trying the wrong PlayPlay key is what produced the
-        // high-entropy "unknown-container" failures in the previous build.
+        // full download. The playplay response key is obfuscated and file-bound,
+        // so only the finished key lifted from the live player object can match
+        // the stream.
         let encryptedProbe: Data
         do {
             encryptedProbe = try await fetchPrefix(url: url, length: Self.probeByteCount)

@@ -86,7 +86,6 @@ struct NonIOS14PremiumPatchingGroup: HookGroup { }
 struct IOS14And15PremiumPatchingGroup: HookGroup { }
 struct V91PremiumPatchingGroup: HookGroup { } // For Spotify 9.1.x versions
 struct LatestPremiumPatchingGroup: HookGroup { }
-struct NativeAudioKeyGroup: HookGroup { } // 9.1.70 custom AES decryptor
 
 func activatePremiumPatchingGroup() {
     BasePremiumPatchingGroup().activate()
@@ -438,24 +437,14 @@ struct EeveeSpotify: Tweak {
             } else {
                 writeDebugLog("[INIT] Settings_PlatformImpl.SettingsListViewController missing")
             }
-            // Capture the already-deobfuscated AES key from Spotify's own
-            // 9.1.70 audio decryptor. This is what makes CDN downloads
-            // decryptable without reimplementing the PlayPlay key VM.
-            //
-            // Do NOT resolve the Spotify address or install this hook during
-            // dyld/Tweak init. Under LiveContainer the tweak is initialized
-            // while the guest image is still being loaded, and an early address
-            // probe used to abort launch before the app could start. Defer to
-            // the main run loop; if the layout is wrong we skip the hook and
-            // the app still launches.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-                if NativeAudioKeyCapture.shared.isSupported {
-                    NativeAudioKeyGroup().activate()
-                    writeDebugLog("[INIT] Activated NativeAudioKeyGroup (deferred)")
-                } else {
-                    writeDebugLog("[INIT] Skipped NativeAudioKeyGroup (unsupported Spotify build/address)")
-                }
-            }
+            // Audio-key capture is now a read-only player-object scan
+            // performed when a download starts
+            // (`NativeAudioKeyCapture.scanForKeys()`). It replaces the old
+            // inline `FunctionHook` on the decrypt entry: patching that
+            // `__TEXT` page is fatal under LiveContainer/iOS 26 (the page stays
+            // `rw-` and the code-signing monitor kills the process). No hook is
+            // installed here, so launch stays clean.
+            writeDebugLog("[INIT] Native audio key capture: player-object scan (no inline hook)")
 
             NSLog("[EeveeSpotify] Initialization complete for 9.1.x")
             TrueShuffleHook.install()

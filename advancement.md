@@ -154,30 +154,30 @@ P0 gaps found before Phase 1:
 
 ### 3.7 Native 9.1.70 audio decryptor (key path)
 
-The playplay response contains an **obfuscated** 16-byte key. Deobfuscating it requires Spotify's PlayPlay VM/token, which is a moving target. Rather than reimplementing it, the pipeline captures the **already-deobfuscated AES key** from the app's own decryptor while the track plays.
+The playplay response contains an **obfuscated** 16-byte key. `unplayplay::decrypt_and_bind_key(obfuscatedKey, fileId)` first decrypts it with a per-client white box and then binds it to the audio file id; both halves are version-specific. The app, however, keeps the **finished** key in plaintext inside its live audio player object, so the downloader lifts that key instead of reimplementing PlayPlay.
 
-Evidence from the 9.1.70 Mach-O (`ipa_original/Spotify_9.1.70.ipa`):
+Evidence from the 9.1.70 Mach-O (`ipa_original/Spotify_9.1.70.ipa`), confirmed by disassembly:
 
 | Item | Value / finding |
 |---|---|
-| Custom audio decrypt entry | VA `0x1069101a0`, signature `(object, streamOffset, out, in, length)` |
-| Function prologue | `ff8301d1 fa6701a9 f85f02a9 f65703a9` (`sub sp, sp, #0x60`, callee-saved pushes) |
-| Fixed CTR IV | VA `0x109afe750` (`72e067fbddcbcf77ebe8bc643f630d93`) |
-| AES T-tables | VA `0x109afe760` |
-| AES block routine | VA `0x106e9290c`; reads the 16-byte AES input at `x0` and round keys at `x0+0x10` |
-| Key-schedule thunk | VA `0x109053200` → `aes_block(object + 0x10, object + 0x2f8)` |
-| Decryptor object layout | `+0x00` mode byte, `+0x10` 16-byte CTR counter/input, `+0x20` 176-byte AES-128 key schedule, `+0x2f8` keystream, `+0x308` block index, `+0x330` second CTR context |
-| **AES key location** | **`object + 0x20`** (first 16 bytes of an AES-128 key schedule are the cipher key) |
+| Audio decrypt entry | VA `0x1069101a0`, signature `(object, streamOffset, out, in, length)`, returns void |
+| Function prologue | `ff8301d1 fa6701a9 f85f02a9 f65703a9` (`sub sp, sp, #0x60` + callee-saved pushes) |
+| Cipher | **standard AES-128-CTR** for playback (mode 0): fixed IV `72e067fbddcbcf77ebe8bc643f630d93`, counter advanced by byte offset. The custom 13-round white-box path (mode 1) is not used by playback |
+| Key setup | VA `0x103b62cc0(object, keyPtr)`; mode 0 calls `0x100ad09b0(object+0x310, keyPtr, 0x80, 1, &len)`, then sets `+0x04 = len`, `+0x08 = 1` |
+| Key-setter wrapper | VA `0x101231c1c`; locks `this+8`, then `setKey(this+0x78, key)` |
+| Player layout | `+0x78` -> inner object; `+0x564` key material (28 bytes, first 16 = AES key); `+0x580` active flag; `+0x593`/`+0x594` stream-ready flags; `+0x598`/`+0x5a0` buffer begin/end |
+| Inner object | decryptor embedded at `+0x78`: `+0x00` mode, `+0x04` key length, `+0x08` has-key, `+0x0c` mode echo, `+0x310` provider |
+| Key writer | VA `0x100e67d90`: receives the finished key, calls `setKey(inner+0x78, key)`, then stores `key[0..15]` at `player+0x564` and `key[12..27]` at `player+0x570`; sets `+0x580 = 1` |
+| Playback caller | VA `0x101ccc338`: requires `+0x580`, `+0x593`, `+0x594` == 1 and a non-empty buffer; builds a stack mode-0 decryptor, `setKey(sp, player+0x564)`, decrypts in place at offset 0 |
 | Ogg prefix | After decryption, skip the first **167 bytes** before the real `OggS` page (matches Votify/librespot) |
 
-Implementation:
+Implementation (read-only, no code patching):
 
-- `NativeAudioKeyCapture.swift` resolves the unslid VA through the main-image slide, verifies the function prologue, reads `object + 0x20`, and stores a bounded, deduplicated list of recent keys.
-- `NativeAudioKeyHook.x.swift` uses Orion `FunctionHook` at the runtime address. It is activated only for a build whose version starts with `9.1.70` **and** whose prologue matches, so a different Spotify build cannot be patched at a stale address.
-- `DownloadManager` passes the captured keys (newest first) to `SpotifyCDNClient`.
-- `SpotifyCDNClient` fetches an 8 KiB encrypted prefix with a Range request, tries every captured key, and keeps the one that produces a real container header (`OggS` at 0 or 167, `ftyp` at 4, `fLaC`, `ID3`, or MPEG sync). It then downloads and decrypts the full stream with that key.
+- `EeveeScanPlayerAudioKeys` (C) walks readable+writable regions in 2 MiB chunks and looks for a player object: `[base+0x580] == 1`, a plausible heap pointer at `[base+0x78]`, and a live decryptor header at `*[base+0x78]+0x78` (`+0x08 == 1`, `+0x0c == +0x00`). Each match contributes the 16 bytes at `base+0x564` (deduplicated, max 16).
+- `NativeAudioKeyCapture.scanForKeys()` runs that scan away from the main thread and keeps a bounded newest-first list of keys. The prologue of `0x1069101a0` is still checked as a version/layout gate, but the address is never called or patched.
+- `DownloadManager` passes the keys to `SpotifyCDNClient`, which probes an 8 KiB encrypted prefix and keeps the key that produces a real container header. Stale keys from a previously played track are therefore rejected automatically.
 
-This also solves the quality/key mismatch problem: if the app's own stream URL is captured, the download uses the exact file the app is playing, so the captured key is guaranteed to belong to that file. If only metadata candidates are available, the multi-key probe filters out keys from other prefetched tracks.
+An earlier attempt installed an Orion `FunctionHook` on `0x1069101a0`. That is abandoned: under LiveContainer/iOS 26 the patched `__TEXT` page is left `rw-` and the code-signing monitor kills the process (`CODESIGNING "Invalid Page"`, fault `0x117fa9bf8` on the same 16 KiB page as the entry point).
 
 ---
 
@@ -356,22 +356,20 @@ download failed: Decrypted file did not contain a valid audio container
 
 New files:
 
+- `Sources/EeveeSpotifyC/EeveeMemory.m` / `include/EeveeMemory.h`
+  - `EeveeReadMemory`: fault-free `mach_vm_read_overwrite` wrapper.
+  - `EeveeScanPlayerAudioKeys`: read-only player-struct scan (§3.7), with a region/submap walk, 2 MiB chunks, time/byte budgets, and deduplicated 16-byte keys.
 - `Sources/EeveeSpotify/Download/Capture/NativeAudioKeyCapture.swift`
-  - Main-image slide resolution + prologue check for `0x1069101a0`.
-  - Reads `object + 0x20` (AES-128 key schedule), deduplicates, keeps the newest 16 keys.
-  - Logs `AUDIO-KEY-CAPTURE native key=… counter=… total=…`.
-- `Sources/EeveeSpotify/Download/Capture/NativeAudioKeyHook.x.swift`
-  - Orion `FunctionHook` with the five-argument ABI.
-  - `hookWillActivate()` requires version prefix `9.1.70` **and** a matching prologue.
-  - `hookDidActivate()` logs the resolved runtime address.
-- `Tweak.x.swift`
-  - Adds `NativeAudioKeyGroup` and activates it in the 9.1.x branch.
+  - Resolves the Spotify image (never image 0) and checks the `0x1069101a0` prologue as a layout gate.
+  - Calls `EeveeScanPlayerAudioKeys`, keeps the newest 16 keys, and logs `AUDIO-KEY-SCAN status=ok regions=… scanned=…B candidates=… keys=… values=…`.
 
 Changed files:
 
+- `Tweak.x.swift`
+  - `NativeAudioKeyGroup` and the inline hook were removed. Init only records that capture is a player-object scan, so launch stays clean.
 - `DownloadManager.swift`
-  - Logs `AUDIO-KEY-CAPTURE candidates=… playplay=…`.
-  - Fails fast with "start playback, then retry" when no native key has been captured.
+  - Logs `AUDIO-KEY-SCAN candidates=… playplay=…`.
+  - Fails fast with "start playback, then retry" when no player key was found.
   - Passes the captured keys to the CDN client instead of the obfuscated playplay key.
 - `SpotifyCDNClient.swift`
   - `downloadEncryptedStream(url:keys:…)` performs an 8 KiB Range probe first.
@@ -379,7 +377,7 @@ Changed files:
   - Falls back to a plain GET if the CDN rejects the Range header.
   - Decrypts the full stream with the selected key.
   - Detects the 167-byte Ogg prefix and strips it before publishing.
-  - Logs `AUDIO-KEY-PROBE match|miss key=… head=…` and `AUDIO-KEY-PROBE selected …`.
+  - Logs `AUDIO-KEY-PROBE selected …`.
 
 ### 6.6 Ogg Vorbis -> AAC/M4A transcode (this change)
 
@@ -489,7 +487,7 @@ On 9.1.70 passive capture is rare. The active resolver now always runs, even whe
 | **M0 — Research and route selection** | Done | Native offline ruled out; Local Files accepted; OnTheSpot protocol mapped |
 | **M1 — Phase 1 probe code** | Done in source | Parser exposes formats; resolver exposes candidates; downloader logs candidates and container; no selection change |
 | **M2 — On-device probe** | Done | Candidate list captured; playplay 400 fixed; all Ogg candidates resolvable; storage-resolve + CDN download confirmed |
-| **M2.5 — Native key + decryption** | In progress | Hook captures the 9.1.70 native AES key; multi-key probe selects it; decrypted bytes contain `OggS`; 167-byte prefix stripped |
+| **M2.5 — Native key + decryption** | In progress | Read-only player-struct scan recovers the finished AES key; multi-key probe selects it; decrypted bytes contain `OggS`; 167-byte prefix stripped |
 | **M3 — Direct MP4 path** | Not applicable (no MP4 offered) | If a future track offers MP4 and it is playable: rank MP4 first, output `.m4a`, verify offline playback. Tested tracks offered no MP4, so M4 is the path |
 | **M4 — Ogg → AAC/M4A transcode** | Implemented in source; retest pending | stb_vorbis decode + AudioToolbox AAC/M4A encode is wired into the publish path; verify duration/seek on-device |
 | **M5 — Local Files verification** | Pending | Track appears under Local Files and plays in airplane mode after relaunch |
@@ -504,9 +502,9 @@ On 9.1.70 passive capture is rare. The active resolver now always runs, even whe
 
 ### M2.5 acceptance detail
 
-- `[INIT] Activated NativeAudioKeyGroup` and `AUDIO-KEY-CAPTURE hook active address=…` appear after launch.
-- Playing the target track produces at least one `AUDIO-KEY-CAPTURE native key=…` line.
-- Pressing Download produces `AUDIO-KEY-PROBE match … offset=167` (or `offset=0`) and `AUDIO-KEY-PROBE selected …`.
+- `AUDIO-KEY-SCAN status=ok … candidates=<n> keys=<n> values=[…]` appears after tapping Download while the track is playing.
+- The scan reports at least one candidate key and no code page is modified (no `CODESIGNING`/`KERN_PROTECTION_FAILURE` crash).
+- Pressing Download produces `AUDIO-KEY-PROBE selected container=… offset=167` (or `offset=0`).
 - The decrypted staging file contains `OggS` at the detected offset and is stripped to start with `OggS`.
 - The resulting Ogg can be inspected/replayed locally before the M4 transcode.
 
@@ -550,8 +548,9 @@ If any condition fails, move to M4.
 6. **Transcoder binary size and licensing.** libvorbis is small and permissive, but still needs an iOS build and integration.
 7. **`storage-resolve` product/path parameter.** The current request uses `product=0` and the interactive audio path. MP4/EME files may require a different product or path; an `unavailable` MP4 result is not proof that the file is globally unavailable.
 8. **No build/test in this workspace.** The source changes are not compiled; the next real gate is the macOS build and the on-device probe.
-9. **Hook address/version coupling.** `0x1069101a0` and the `object + 0x20` layout are specific to the 9.1.70 IPA. The hook checks the version prefix and the function prologue before patching; a different build must be re-analyzed rather than reused.
-10. **Key/file-id association.** The app may prefetch the next track's key. The multi-key probe rejects wrong keys, and the downloader now iterates every resolved candidate (not just the first) so a playback-quality mismatch falls through. Preferring the app's captured stream URL remains the strongest guarantee.
+9. **Layout/address coupling.** `0x1069101a0`, `0x100e67d90`, `0x101231c1c` and the `player+0x78` / `+0x564` / `+0x580` offsets are specific to the 9.1.70 IPA. The scan still checks the decrypt-entry prologue and falls back to a multi-key probe, but a different build must be re-analyzed rather than assumed compatible.
+10. **Key/file-id association.** The app may prefetch the next track's key, and the key lives in the player object only while that track is loaded. The multi-key probe rejects wrong keys, the downloader iterates every resolved candidate, and the UI asks the user to start playback first. Keys from a previously played track are harmless.
+11. **Player object must be live.** The finished key is lifted from the live player object, so a track that was never loaded in the current session has no key to find. This is the documented Local Files UX limit ("play it first").
 11. **Transcoder size/CPU.** stb_vorbis is a single ~188 KB public-domain C file and AudioToolbox supplies the AAC encoder, so binary growth is modest. Decoding+encoding a full track costs CPU time; it runs off the main thread and is not cancellable mid-transcode yet. stb_vorbis does not support old floor-0 Vorbis files, but Spotify's streams use floor 1.
 12. **Personal-use/ToS risk.** This is an in-app personal downloader; do not distribute downloaded content.
 
@@ -581,3 +580,6 @@ If any condition fails, move to M4.
 | 2026-10-26 | Cloud build gate 1: renamed `EeveeOggDecoder.c` to `.m` because the `EeveeSpotifyC` module umbrella also exposes `Tweak.h` (Foundation), which a pure-C translation unit cannot build. The build then compiled. On-device launch then crashed under LiveContainer: `_dyld_get_image_vmaddr_slide(0)` is LiveContainer's slide (`0x4d1c000`), so `0x1069101a0 + slide = 0x10b62c1a0` landed in the unmapped gap between the images. The resolver now finds the image named `Spotify`, uses its slide, and `dladdr`-validates the pointer before reading the prologue. Rebuild pending. |
 | 2026-10-27 | Launch hardening for the native-key hook: the prologue is now read with `mach_vm_read_overwrite`, which returns `KERN_INVALID_ADDRESS` instead of faulting, and `NativeAudioKeyGroup` activation is deferred until after the main run loop. A repeated crash still reported the pre-fix dylib UUID `d2563434-9f1c-3949-9925-14fba8afecc8`, so the tested install was stale. Rebuild from the branch tip and verify the dylib UUID changes. |
 | 2026-10-27 | Build gate: the public iOS SDK does not declare `mach_vm_read_overwrite` for Swift. Exposed the safe read through `EeveeSpotifyC` as `EeveeReadMemory`, a small C shim that declares the libsystem_kernel symbol and calls it with `mach_task_self()`. The hook remains deferred until after launch. |
+| 2026-10-27 | Root-caused the 3–5 s post-launch crash: the Orion inline hook on the decrypt entry leaves the patched `__TEXT` page `rw-` under LiveContainer/iOS 26 and the code-signing monitor kills the process (`CODESIGNING "Invalid Page"`, fault `0x117fa9bf8` on the same 16 KiB page as `0x1069101a0`). Deleted `NativeAudioKeyHook.x.swift` and removed `NativeAudioKeyGroup` / deferred activation. Launch is hook-free now. |
+| 2026-10-27 | Corrected the decryption model. 9.1.70 playback uses the **mode-0 standard AES-128-CTR** path with the fixed IV; the custom 13-round cipher is the unused mode-1 path, so the existing `StreamCTREncryptor` was never the problem. The `/playplay/v1/key/{fileId}` response is a 16-byte **obfuscated** key that `decrypt_and_bind_key(obfuscatedKey, fileId)` turns into the real key; the app stores that real key in plaintext. Do not port the 350 KB white box. |
+| 2026-10-27 | Replaced the never-valid standard AES-schedule scan with `EeveeScanPlayerAudioKeys`. It recovers the finished key at `player+0x564` by matching the live player object (`+0x580 == 1`, heap pointer at `+0x78`, decryptor header at `*[player+0x78]+0x78` with mode echo `+0x0c == +0x00` and has-key `+0x08 == 1`). Read-only, chunked, time/byte bounded, no code patching and no native calls. The existing 8 KiB probe then selects the key that belongs to the resolved candidate. Cloud rebuild and on-device validation pending. |

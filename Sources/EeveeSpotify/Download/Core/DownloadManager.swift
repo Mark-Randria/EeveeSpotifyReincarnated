@@ -307,9 +307,19 @@ final class DownloadManager {
                 return
             }
 
-            let nativeKeys = NativeAudioKeyCapture.shared.candidateKeys()
+            guard !downloadCandidates.isEmpty else {
+                setState(.failed("No audio stream captured for this track yet — play it first"))
+                return
+            }
+
+            // Read-only heap scan for the live player object's finished
+            // AES-128 key (the PlayPlay response key is obfuscated and
+            // file-bound, so it cannot be used directly). Runs on a background
+            // queue because it walks the app's writable footprint; never on the
+            // main thread.
+            let nativeKeys = await DownloadManager.scanNativeAudioKeys()
             DownloadLogger.shared.log(
-                "AUDIO-KEY-CAPTURE candidates=\(nativeKeys.count) downloadCandidates=\(downloadCandidates.count)"
+                "AUDIO-KEY-SCAN candidates=\(nativeKeys.count) downloadCandidates=\(downloadCandidates.count)"
             )
             for candidate in downloadCandidates {
                 let playplayHex = candidate.key.map { String(format: "%02x", $0) }.joined()
@@ -320,14 +330,9 @@ final class DownloadManager {
 
             guard !nativeKeys.isEmpty else {
                 DownloadLogger.shared.log(
-                    "AUDIO-KEY-CAPTURE no native key yet — playback must reach the audio decryptor before downloading"
+                    "AUDIO-KEY-SCAN no player audio key found — the player object must be live in memory (start playback, then retry)"
                 )
-                setState(.failed("Audio key not captured yet — start playback, then retry"))
-                return
-            }
-
-            guard !downloadCandidates.isEmpty else {
-                setState(.failed("No audio stream captured for this track yet — play it first"))
+                setState(.failed("Audio key not found yet — start playback, then retry"))
                 return
             }
 
@@ -448,6 +453,17 @@ final class DownloadManager {
     }
 
     // MARK: - Helpers
+
+    /// Runs `NativeAudioKeyCapture.scanForKeys()` away from the main thread.
+    private static func scanNativeAudioKeys() async -> [Data] {
+        await withCheckedContinuation { (continuation: CheckedContinuation<[Data], Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(
+                    returning: NativeAudioKeyCapture.shared.scanForKeys()
+                )
+            }
+        }
+    }
 
     static func sanitizedFileName(artist: String, title: String) -> String {
         let forbidden = CharacterSet(charactersIn: "/:").union(.controlCharacters)
