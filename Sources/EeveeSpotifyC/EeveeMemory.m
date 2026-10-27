@@ -1,5 +1,6 @@
 #include "EeveeMemory.h"
 #include <mach/mach.h>
+#include <stddef.h>
 
 // mach_vm_read_overwrite is exported by libsystem_kernel, but the public iOS
 // SDK does not declare it for Swift (macOS does). Declare it here so the C
