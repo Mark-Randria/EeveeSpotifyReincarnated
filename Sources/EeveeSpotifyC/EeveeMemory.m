@@ -70,12 +70,14 @@ int32_t EeveeReadMemory(uint64_t address,
 //   +0x04  key length
 //   +0x08  has-key         (1 once a key was installed)
 //   +0x0c  mode echo       (0 for mode 0, 1 for mode 1)
+//   +0x310 provider object (vtable = 0x10bfa5350, see below)
+//   +0x318 provider state  (heap pointer to the derived key schedule)
 //
 // Finding that object is read-only and gives us the already deobfuscated,
 // file-bound AES key, so the normal AES-128-CTR path can decrypt the CDN
 // stream. The `+0x580` byte filters out 255/256 of scan positions and the
-// decryptor-header check rejects almost all of the rest, so only a handful of
-// keys are ever returned.
+// decryptor-header check rejects almost all of the rest. The provider vtable is
+// the definitive check: no unrelated heap object carries it.
 
 #define EEVEE_PLAYER_INNER_OFFSET   0x78u
 #define EEVEE_PLAYER_KEY_OFFSET     0x564u
@@ -83,6 +85,13 @@ int32_t EeveeReadMemory(uint64_t address,
 #define EEVEE_DECRYPTOR_OFFSET      0x78u
 #define EEVEE_PLAYER_WINDOW         (EEVEE_PLAYER_MODE_OFFSET + 8u)
 #define EEVEE_PLAYER_OVERLAP        0x588u
+
+// The decryptor constructor at `0x104fc6b54` writes a fixed vtable pointer
+// (file VA `0x10bfa5350`, inside `__DATA_CONST`) to `decryptor + 0x310`.
+// That value is the definitive proof that a candidate window really contains a
+// live decryptor instead of random heap bytes that happen to have a `1` at
+// `+0x08`. `+0x318` holds the lazily allocated key-schedule object.
+#define EEVEE_PROVIDER_VTABLE_OFFSET 0x310u   // +0x318 state, +0x324 ready
 
 typedef kern_return_t (*EeveeRegionRecurseFn)(vm_map_t target_task,
                                               mach_vm_address_t *address,
@@ -104,6 +113,7 @@ typedef struct {
     uint32_t max_keys;
     uint32_t count;
     uint32_t candidates;
+    uint32_t vtable_hits;
 } EeveeKeyCollector;
 
 /// A stored C++ object pointer on this binary (plain arm64, no pointer
@@ -155,6 +165,7 @@ static void eevee_collect_key(EeveeKeyCollector *collector,
 
 static void eevee_scan_player_buffer(const uint8_t *buffer,
                                      uint64_t length,
+                                     uint64_t decryptor_vtable,
                                      EeveeKeyCollector *collector) {
     if (length < (uint64_t)EEVEE_PLAYER_WINDOW) {
         return;
@@ -182,20 +193,52 @@ static void eevee_scan_player_buffer(const uint8_t *buffer,
             continue;
         }
 
+        collector->candidates++;
+
+        uint64_t decryptor = inner + EEVEE_DECRYPTOR_OFFSET;
+
+        // One read covers the whole key provider: `+0x310` vtable, `+0x318`
+        // derived-schedule pointer, `+0x324` initialised byte.
+        uint8_t provider[0x20] = {0};
+        uint64_t provider_bytes = 0;
+        if (EeveeReadMemory(decryptor + EEVEE_PROVIDER_VTABLE_OFFSET,
+                            sizeof(provider),
+                            provider,
+                            &provider_bytes) != 0 ||
+            provider_bytes < sizeof(provider)) {
+            continue;
+        }
+        uint64_t vtable = 0;
+        uint64_t state = 0;
+        memcpy(&vtable, provider, sizeof(vtable));
+        memcpy(&state, provider + 8, sizeof(state));
+        uint8_t provider_ready = provider[0x14];
+
+        // The vtable is unique to real decryptors. The `ready` byte plus a heap
+        // pointer to the derived schedule is the fallback signature when the
+        // image slide (and therefore the expected vtable) is unavailable.
+        int vtable_match = decryptor_vtable != 0 && vtable == decryptor_vtable;
+        int provider_signature = provider_ready == 1 &&
+                                 eevee_pointer_plausible(state);
+        if (!vtable_match && !provider_signature) {
+            continue;
+        }
+        if (vtable_match) {
+            collector->vtable_hits++;
+        }
+
         // Probe the embedded decryptor's header. Reading across a region
         // boundary is safe: EeveeReadMemory reports short reads instead of
         // faulting.
         uint8_t header[16] = {0};
         uint64_t got = 0;
-        if (EeveeReadMemory(inner + EEVEE_DECRYPTOR_OFFSET,
+        if (EeveeReadMemory(decryptor,
                             sizeof(header),
                             header,
                             &got) != 0 ||
             got < sizeof(header)) {
             continue;
         }
-
-        collector->candidates++;
 
         if (header[0] > 1) {        // unknown decryptor mode
             continue;
@@ -205,13 +248,39 @@ static void eevee_scan_player_buffer(const uint8_t *buffer,
         }
         // Initialisation clears +0x0c; the mode-1 key path sets it to 1 while
         // the mode-0 (playback) path leaves it 0. So a live decryptor always has
-        // `header[0x0c] == header[0]`, which rejects almost every coincidence.
+        // `header[0x0c] == header[0]`.
         if (header[0x0c] != header[0]) {
             continue;
         }
 
+        // `setKey(decryptor, player+0x564)` receives exactly this pointer, so
+        // the first 16 bytes are the finished AES key for the loaded track.
         eevee_collect_key(collector,
                           buffer + offset + EEVEE_PLAYER_KEY_OFFSET);
+
+        // Fallback in case the effective key is the derived schedule: byte
+        // 0..15 of an AES-128 schedule is the key itself, and some paths keep
+        // the words reversed.
+        if (collector->count < collector->max_keys &&
+            eevee_pointer_plausible(state)) {
+            uint8_t schedule[16] = {0};
+            uint64_t schedule_bytes = 0;
+            if (EeveeReadMemory(state,
+                                sizeof(schedule),
+                                schedule,
+                                &schedule_bytes) == 0 &&
+                schedule_bytes == sizeof(schedule)) {
+                static const uint8_t word_swap[16] = {
+                    3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12
+                };
+                uint8_t reversed[16];
+                for (int i = 0; i < 16; i++) {
+                    reversed[i] = schedule[word_swap[i]];
+                }
+                eevee_collect_key(collector, schedule);
+                eevee_collect_key(collector, reversed);
+            }
+        }
     }
 }
 
@@ -224,6 +293,7 @@ static uint64_t eevee_scan_player_range(uint64_t start,
                                         uint64_t deadline_ticks,
                                         uint8_t *buffer,
                                         uint64_t chunk_size,
+                                        uint64_t decryptor_vtable,
                                         EeveeKeyCollector *collector) {
     uint64_t scanned = 0;
     uint64_t position = start;
@@ -253,7 +323,10 @@ static uint64_t eevee_scan_player_range(uint64_t start,
         }
 
         uint64_t available = carried + got;
-        eevee_scan_player_buffer(buffer, available, collector);
+        eevee_scan_player_buffer(buffer,
+                                 available,
+                                 decryptor_vtable,
+                                 collector);
 
         uint64_t keep = available < EEVEE_PLAYER_OVERLAP
                             ? available
@@ -278,6 +351,7 @@ typedef struct {
     uint64_t byte_budget;
     uint64_t scanned;
     uint64_t deadline_ticks;
+    uint64_t decryptor_vtable;
     EeveeKeyCollector collector;
 } EeveePlayerKeyScan;
 
@@ -296,6 +370,7 @@ static int eevee_player_range_visitor(uint64_t start,
                                              scan->deadline_ticks,
                                              scan->buffer,
                                              scan->chunk_size,
+                                             scan->decryptor_vtable,
                                              &scan->collector);
 
     return scan->collector.count >= scan->collector.max_keys;
@@ -316,7 +391,7 @@ static int32_t eevee_enumerate_writable_regions(EeveeRangeVisitor visitor,
     }
 
     uint32_t region_count = 0;
-    const uint64_t max_region_bytes = 512ull * 1024 * 1024;
+    const uint64_t max_region_bytes = 2ull * 1024 * 1024 * 1024;
 
     if (recurse != NULL) {
         mach_vm_address_t address = 0;
@@ -417,12 +492,14 @@ static int32_t eevee_enumerate_writable_regions(EeveeRangeVisitor visitor,
 
 int32_t EeveeScanPlayerAudioKeys(uint64_t max_scan_bytes,
                                  uint64_t max_duration_ms,
+                                 uint64_t decryptor_vtable,
                                  uint8_t *out_keys,
                                  uint32_t max_keys,
                                  uint32_t *out_key_count,
                                  uint64_t *out_scanned_bytes,
                                  uint32_t *out_region_count,
-                                 uint32_t *out_candidate_count) {
+                                 uint32_t *out_candidate_count,
+                                 uint32_t *out_vtable_count) {
     if (out_key_count != NULL) {
         *out_key_count = 0;
     }
@@ -434,6 +511,9 @@ int32_t EeveeScanPlayerAudioKeys(uint64_t max_scan_bytes,
     }
     if (out_candidate_count != NULL) {
         *out_candidate_count = 0;
+    }
+    if (out_vtable_count != NULL) {
+        *out_vtable_count = 0;
     }
     if (out_keys == NULL || max_keys == 0) {
         return EEVEE_KEY_SCAN_INVALID_ARGUMENT;
@@ -468,7 +548,8 @@ int32_t EeveeScanPlayerAudioKeys(uint64_t max_scan_bytes,
         .byte_budget = max_scan_bytes,
         .scanned = 0,
         .deadline_ticks = deadline,
-        .collector = {out_keys, max_keys, 0, 0},
+        .decryptor_vtable = decryptor_vtable,
+        .collector = {out_keys, max_keys, 0, 0, 0},
     };
 
     int32_t status = eevee_enumerate_writable_regions(
@@ -490,6 +571,9 @@ int32_t EeveeScanPlayerAudioKeys(uint64_t max_scan_bytes,
     }
     if (out_candidate_count != NULL) {
         *out_candidate_count = scan.collector.candidates;
+    }
+    if (out_vtable_count != NULL) {
+        *out_vtable_count = scan.collector.vtable_hits;
     }
     return EEVEE_KEY_SCAN_OK;
 }

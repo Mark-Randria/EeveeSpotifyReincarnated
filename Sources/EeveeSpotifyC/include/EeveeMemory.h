@@ -28,20 +28,29 @@ enum {
 /// player objects and extracts the per-track AES-128 audio key that the app has
 /// already deobfuscated and bound to the audio file id.
 ///
-/// Each match contributes its 16-byte key to `outKeys` (`maxKeys * 16` bytes).
-/// `outScannedBytes`, `outRegionCount` and `outCandidateCount` (number of
-/// positions whose embedded decryptor looked live) are diagnostics.
+/// `decryptorVTable` is the runtime address of the decryptor key provider's
+/// vtable (`0x10bfa5350 + image slide` on 9.1.70). It is the definitive check
+/// that a candidate window holds a real decryptor; pass 0 to skip it.
+///
+/// Each match contributes its 16-byte key to `outKeys` (`maxKeys * 16` bytes),
+/// plus (when available) the derived AES key schedule, so the caller's CDN
+/// probe can pick the effective key. `outScannedBytes`, `outRegionCount`,
+/// `outCandidateCount` (positions whose embedded decryptor header looked live)
+/// and `outVTableCount` (positions that also matched the provider vtable) are
+/// diagnostics.
 ///
 /// Read-only: no code pages are patched, so this is safe under
 /// LiveContainer/iOS code signing. Call away from the main thread.
 int32_t EeveeScanPlayerAudioKeys(uint64_t maxScanBytes,
                                  uint64_t maxDurationMilliseconds,
+                                 uint64_t decryptorVTable,
                                  uint8_t *outKeys,
                                  uint32_t maxKeys,
                                  uint32_t *outKeyCount,
                                  uint64_t *outScannedBytes,
                                  uint32_t *outRegionCount,
-                                 uint32_t *outCandidateCount);
+                                 uint32_t *outCandidateCount,
+                                 uint32_t *outVTableCount);
 
 #ifdef __cplusplus
 }

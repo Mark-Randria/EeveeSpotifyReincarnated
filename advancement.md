@@ -173,11 +173,14 @@ Evidence from the 9.1.70 Mach-O (`ipa_original/Spotify_9.1.70.ipa`), confirmed b
 
 Implementation (read-only, no code patching):
 
-- `EeveeScanPlayerAudioKeys` (C) walks readable+writable regions in 2 MiB chunks and looks for a player object: `[base+0x580] == 1`, a plausible heap pointer at `[base+0x78]`, and a live decryptor header at `*[base+0x78]+0x78` (`+0x08 == 1`, `+0x0c == +0x00`). Each match contributes the 16 bytes at `base+0x564` (deduplicated, max 16).
+- The decryptor constructor `0x104fc6b54` installs a **fixed vtable pointer** — file VA `0x10bfa5350` inside `__DATA_CONST`, so runtime value `0x10bfa5350 + slide` — at `decryptor + 0x310`, and stores `+0x08 = 1` / `+0x0c = mode` in `setKey`. That vtable is the decisive test; the header bytes alone match thousands of unrelated heap objects.
+- `EeveeScanPlayerAudioKeys` (C) walks readable+writable regions in 2 MiB chunks. A candidate window must have `[base+0x580] == 1`, a plausible heap pointer at `[base+0x78]`, `[*[base+0x78]+0x78+0x310] == vtable`, and a live header (`+0x08 == 1`, `+0x0c == +0x00`). Each match contributes the 16 bytes at `base+0x564` (deduplicated; plus the derived provider schedule `[+0x318]` as a fallback candidate).
 - `NativeAudioKeyCapture.scanForKeys()` runs that scan away from the main thread and keeps a bounded newest-first list of keys. The prologue of `0x1069101a0` is still checked as a version/layout gate, but the address is never called or patched.
 - `DownloadManager` passes the keys to `SpotifyCDNClient`, which probes an 8 KiB encrypted prefix and keeps the key that produces a real container header. Stale keys from a previously played track are therefore rejected automatically.
 
 An earlier attempt installed an Orion `FunctionHook` on `0x1069101a0`. That is abandoned: under LiveContainer/iOS 26 the patched `__TEXT` page is left `rw-` and the code-signing monitor kills the process (`CODESIGNING "Invalid Page"`, fault `0x117fa9bf8` on the same 16 KiB page as the entry point).
+
+A first version of the scan matched only `[+0x08] == 1` and `[+0x0c] == [+0x00]` and returned 16 keys in the first 10 MB — all false positives (`02000000…`, `trackNumber`, …). The CDN probe rejected every one. The vtable check above was added so the scan can only return keys from real player decryptors.
 
 ---
 
@@ -359,9 +362,11 @@ New files:
 - `Sources/EeveeSpotifyC/EeveeMemory.m` / `include/EeveeMemory.h`
   - `EeveeReadMemory`: fault-free `mach_vm_read_overwrite` wrapper.
   - `EeveeScanPlayerAudioKeys`: read-only player-struct scan (§3.7), with a region/submap walk, 2 MiB chunks, time/byte budgets, and deduplicated 16-byte keys.
+  - Requires the decryptor provider vtable (`0x10bfa5350 + slide`) as the decisive match; `candidates` counts pre-filter hits and `vtableHits` counts real decryptors.
 - `Sources/EeveeSpotify/Download/Capture/NativeAudioKeyCapture.swift`
   - Resolves the Spotify image (never image 0) and checks the `0x1069101a0` prologue as a layout gate.
-  - Calls `EeveeScanPlayerAudioKeys`, keeps the newest 16 keys, and logs `AUDIO-KEY-SCAN status=ok regions=… scanned=…B candidates=… keys=… values=…`.
+  - Computes the runtime provider vtable from the image slide and passes it to the scan.
+  - Calls `EeveeScanPlayerAudioKeys`, keeps the newest 16 keys, and logs `AUDIO-KEY-SCAN status=ok regions=… scanned=…B candidates=… vtableHits=… vtable=0x… keys=… values=…`.
 
 Changed files:
 
@@ -583,3 +588,4 @@ If any condition fails, move to M4.
 | 2026-10-27 | Root-caused the 3–5 s post-launch crash: the Orion inline hook on the decrypt entry leaves the patched `__TEXT` page `rw-` under LiveContainer/iOS 26 and the code-signing monitor kills the process (`CODESIGNING "Invalid Page"`, fault `0x117fa9bf8` on the same 16 KiB page as `0x1069101a0`). Deleted `NativeAudioKeyHook.x.swift` and removed `NativeAudioKeyGroup` / deferred activation. Launch is hook-free now. |
 | 2026-10-27 | Corrected the decryption model. 9.1.70 playback uses the **mode-0 standard AES-128-CTR** path with the fixed IV; the custom 13-round cipher is the unused mode-1 path, so the existing `StreamCTREncryptor` was never the problem. The `/playplay/v1/key/{fileId}` response is a 16-byte **obfuscated** key that `decrypt_and_bind_key(obfuscatedKey, fileId)` turns into the real key; the app stores that real key in plaintext. Do not port the 350 KB white box. |
 | 2026-10-27 | Replaced the never-valid standard AES-schedule scan with `EeveeScanPlayerAudioKeys`. It recovers the finished key at `player+0x564` by matching the live player object (`+0x580 == 1`, heap pointer at `+0x78`, decryptor header at `*[player+0x78]+0x78` with mode echo `+0x0c == +0x00` and has-key `+0x08 == 1`). Read-only, chunked, time/byte bounded, no code patching and no native calls. The existing 8 KiB probe then selects the key that belongs to the resolved candidate. Cloud rebuild and on-device validation pending. |
+| 2026-10-27 | First on-device run of the player scan: no launch crash, `AUDIO-KEY-SCAN status=ok regions=91 scanned=10059776B candidates=2098 keys=16`, but every key was a random heap object (`02000000…`, `trackNumber`, …) and all 16 probes missed. The header checks (`+0x08 == 1`, `+0x0c == +0x00`) are too weak, and stopping at 16 false keys ended the scan after 10 MB. Diagnosed the decryptor constructor `0x104fc6b54`: it writes the fixed vtable of the key-provider object (`0x10bfa5350`, `__DATA_CONST`) to `decryptor + 0x310`. That value is now the decisive match. The scan also passes the image slide in and logs `vtableHits`; the disassembly also confirms `setKey` is `0x101231c1c` (`this+0x78`), so the decryptor is `[player+0x78] + 0x78` as assumed. Cloud rebuild pending. |
