@@ -166,7 +166,7 @@ Evidence from the 9.1.70 Mach-O (`ipa_original/Spotify_9.1.70.ipa`), confirmed b
 | Key setup | VA `0x103b62cc0(object, keyPtr)`; mode 0 calls `0x100ad09b0(object+0x310, …)` for the AES provider; mode 1 calls `0x102717e28(object+0x10, …)` for the white-box path; both then set `+0x04 = len`, `+0x08 = 1` |
 | Key-setter wrapper | VA `0x101231c1c`; locks `this+8`, then `setKey(this+0x78, key)` |
 | Player layout | `+0x78` -> inner object; `+0x1c0` key state (6 after install); `+0x564` key material (28 bytes, first 16 = AES key); `+0x580` active flag; `+0x593`/`+0x594` stream-ready flags; `+0x598`/`+0x5a0` buffer begin/end |
-| Inner object | decryptor embedded at `+0x78`: `+0x00` mode, `+0x04` key length, `+0x08` has-key, `+0x0c` mode echo, `+0x310` provider |
+| Inner object | key-manager object; decryptor embedded at `+0x78`: `+0x00` mode, `+0x04` key length, `+0x08` has-key, `+0x0c` mode echo, `+0x310` provider. This is not the stack-local decryptor used for playback |
 | Key writer | VA `0x100e67d90`: receives the finished key, calls `setKey(inner+0x78, key)`, then stores `key[0..15]` at `player+0x564` and `key[12..27]` at `player+0x570`; sets `+0x580 = 1` |
 | Playback caller | VA `0x101ccc338`: requires `+0x580`, `+0x593`, `+0x594` == 1 and a non-empty buffer; builds a stack mode-0 decryptor, `setKey(sp, player+0x564)`, decrypts in place at offset 0 |
 | Ogg prefix | After decryption, skip the first **167 bytes** before the real `OggS` page (matches Votify/librespot) |
@@ -181,7 +181,7 @@ Implementation (read-only, no code patching):
 
 An earlier attempt installed an Orion `FunctionHook` on `0x1069101a0`. That is abandoned: under LiveContainer/iOS 26 the patched `__TEXT` page is left `rw-` and the code-signing monitor kills the process (`CODESIGNING "Invalid Page"`, fault `0x117fa9bf8` on the same 16 KiB page as the entry point).
 
-A first version of the scan matched only `[+0x08] == 1` and `[+0x0c] == [+0x00]` and returned 16 keys in the first 10 MB — all false positives (`02000000…`, `trackNumber`, …). The CDN probe rejected every one. The vtable check above was added so the scan can only return keys from real player decryptors.
+A first version of the scan matched only `[+0x08] == 1` and `[+0x0c] == [+0x00]` and returned 16 keys in the first 10 MB — all false positives (`02000000…`, `trackNumber`, …). The CDN probe rejected every one. The vtable check was then added in an attempt to restrict matches to real player decryptors; the third run showed that assumption was wrong (next paragraph).
 
 A second on-device run confirmed the layout but not the match: `AUDIO-KEY-SCAN status=ok regions=161 scanned=35241984B candidates=14684 vtableHits=0 vtable=0x12123d350 keys=16` (slide `0x15298000`). Every one of the 16 keys was heap junk (`SPTCollectionPla`, reversed strings, pointer pairs), and all probes missed. The scan again stopped at 35 MB — this time because the **provider-signature fallback** (`[+0x310+0x14] == 1` plus a plausible `[+0x318]`) filled the list before the walk reached the player. `vtableHits=0` therefore only means "the vtable was never seen in the first 35 MB", not "the vtable is wrong". That fallback was removed; both acceptance paths now have a false-positive rate near zero, so the walk runs the whole budget.
 
