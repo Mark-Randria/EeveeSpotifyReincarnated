@@ -16,6 +16,21 @@ import Foundation
 /// `ISO8601DateFormatter` allocation, and a `seekToEnd()` size probe on every
 /// line. All three are now done once or tracked in memory instead of touching
 /// the filesystem per line.
+extension Data {
+    /// Full lowercase hex. Use only for short, non-secret diagnostics.
+    var eeveeHex: String {
+        map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Short fingerprint for logs: first 4 bytes + last 2 bytes. The finished
+    /// AES key is never written to disk or NSLog in full.
+    var eeveeKeyFingerprint: String {
+        let hex = eeveeHex
+        guard hex.count > 16 else { return hex }
+        return "\(hex.prefix(8))…\(hex.suffix(4))"
+    }
+}
+
 final class DownloadLogger {
     static let shared = DownloadLogger()
 

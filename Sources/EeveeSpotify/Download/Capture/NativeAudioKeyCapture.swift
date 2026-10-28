@@ -38,9 +38,14 @@ import MachO
 ///
 /// `EeveeScanPlayerAudioKeys` is syscall-free in its hot loop. It walks
 /// readable+writable memory once, matching the `+0x580 == 1 && +0x1c0 == 6`
-/// player signature and copying the key from `+0x564`. The download path then
-/// checks every key against the encrypted CDN prefix, so a stale key from
-/// another track is discarded automatically.
+/// player pair and copying the key from `+0x564`. The pair alone is too loose
+/// on a pointer-dense heap: the first on-device run collected 32 integer /
+/// pointer windows before reaching the real player. The scan now hard-rejects
+/// low-entropy keys and ranks surviving keys using the key setter's
+/// `+0x1c4 == 16` / `+0x78 != NULL` fields plus the playback caller's
+/// `+0x190`, `+0x593`, `+0x594`, `+0x598 != +0x5a0`, and `+0xe0` checks.
+/// The download path then checks every key against the encrypted CDN prefix,
+/// so a stale key from another track is discarded automatically.
 ///
 /// Capture is a read-only memory scan; no code page is ever written.
 final class NativeAudioKeyCapture {
@@ -69,7 +74,7 @@ final class NativeAudioKeyCapture {
     /// writable footprint must not hide the player object behind the cutoff.
     private static let scanByteBudget: UInt64 = 1024 * 1024 * 1024
     private static let scanTimeBudget: UInt64 = 8_000
-    private static let maxKeys = 32
+    private static let maxKeys = 64
 
     private let lock = NSLock()
     /// Newest first. Bounded so a long session cannot grow without limit.
@@ -97,6 +102,7 @@ final class NativeAudioKeyCapture {
         var regionCount: UInt32 = 0
         var signatureCount: UInt32 = 0
         var playerCount: UInt32 = 0
+        var activeCount: UInt32 = 0
 
         let status: Int32 = rawKeys.withUnsafeMutableBufferPointer { buffer in
             EeveeScanPlayerAudioKeys(
@@ -108,7 +114,8 @@ final class NativeAudioKeyCapture {
                 &scannedBytes,
                 &regionCount,
                 &signatureCount,
-                &playerCount
+                &playerCount,
+                &activeCount
             )
         }
 
@@ -117,7 +124,7 @@ final class NativeAudioKeyCapture {
 
         guard status == 0 else {
             DownloadLogger.shared.log(
-                "AUDIO-KEY-SCAN failed status=\(status) scanned=\(scannedBytes)B regions=\(regionCount) signatures=\(signatureCount) players=\(playerCount) elapsed=\(elapsedText)s"
+                "AUDIO-KEY-SCAN failed status=\(status) scanned=\(scannedBytes)B regions=\(regionCount) signatures=\(signatureCount) players=\(playerCount) active=\(activeCount) elapsed=\(elapsedText)s"
             )
             return latestKeys()
         }
@@ -141,9 +148,20 @@ final class NativeAudioKeyCapture {
         knownKeys = merged
         lock.unlock()
 
-        let hex = found.map { $0.map { String(format: "%02x", $0) }.joined() }
+        // The finished AES key is never logged in full. Fingerprints are enough
+        // to tell a random key from the old integer/pointer junk; the probe's
+        // `selected` line proves which one actually decrypted the stream.
+        let fingerprints = found.prefix(8).map(\.eeveeKeyFingerprint)
+        let valuesText: String
+        if fingerprints.isEmpty {
+            valuesText = "[]"
+        } else if found.count > fingerprints.count {
+            valuesText = "[" + fingerprints.joined(separator: ", ") + ", +\(found.count - fingerprints.count) more]"
+        } else {
+            valuesText = "[" + fingerprints.joined(separator: ", ") + "]"
+        }
         DownloadLogger.shared.log(
-            "AUDIO-KEY-SCAN status=ok regions=\(regionCount) scanned=\(scannedBytes)B signatures=\(signatureCount) players=\(playerCount) elapsed=\(elapsedText)s keys=\(found.count) total=\(merged.count) values=\(hex)"
+            "AUDIO-KEY-SCAN status=ok regions=\(regionCount) scanned=\(scannedBytes)B signatures=\(signatureCount) players=\(playerCount) active=\(activeCount) elapsed=\(elapsedText)s keys=\(found.count) total=\(merged.count) values=\(valuesText)"
         )
         return merged
     }
