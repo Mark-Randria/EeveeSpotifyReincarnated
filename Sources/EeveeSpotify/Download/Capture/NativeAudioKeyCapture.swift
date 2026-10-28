@@ -38,10 +38,17 @@ import MachO
 /// embedded at `+0x310` starts with the fixed vtable of its class
 /// (`0x10bfa5350 + image slide`, in `__DATA_CONST`). That vtable is unique to
 /// real decryptor objects, so the weak "has-key" byte alone can no longer
-/// produce false matches. `EeveeScanPlayerAudioKeys` walks writable memory for
-/// those decryptors and returns the key at `player+0x564`; the download path
-/// then checks each one against the encrypted CDN prefix, so a stale key from
-/// another track is discarded automatically.
+/// produce false matches.
+///
+/// `EeveeScanPlayerAudioKeys` is syscall-free in its hot loop and runs in two
+/// passes: it first walks writable memory for the literal vtable constant (a
+/// hit at `A` gives `host = A - 0x388`), then — only if it found one — walks
+/// again for a pointer to that host (`player = B - 0x78`) and reads the key at
+/// `player+0x564`. A weak signature is deliberately *not* accepted, because on
+/// this pointer-dense heap it fills the key list with junk and stops the walk
+/// before the player is ever reached. The download path then checks every key
+/// against the encrypted CDN prefix, so a stale key from another track is
+/// discarded automatically.
 ///
 /// Capture is a read-only memory scan; no code page is ever written.
 final class NativeAudioKeyCapture {
@@ -73,11 +80,12 @@ final class NativeAudioKeyCapture {
     static let decryptorProviderVTableFileAddress: UInt64 = 0x10bfa5350
 
     /// Bounds the scan so a download tap cannot pin a CPU core indefinitely.
-    /// Byte budget is generous (the scan is time-bounded as well) so a large
-    /// writable footprint cannot hide the player object behind the cutoff.
-    private static let scanByteBudget: UInt64 = 768 * 1024 * 1024
-    private static let scanTimeBudget: UInt64 = 6_000
-    private static let maxKeys = 16
+    /// The budget is per pass and deliberately generous: the hot loop performs
+    /// no syscalls, so a full walk costs well under a second, and a large
+    /// writable footprint must not hide the player object behind the cutoff.
+    private static let scanByteBudget: UInt64 = 1024 * 1024 * 1024
+    private static let scanTimeBudget: UInt64 = 8_000
+    private static let maxKeys = 32
 
     private let lock = NSLock()
     /// Newest first. Bounded so a long session cannot grow without limit.
@@ -104,7 +112,7 @@ final class NativeAudioKeyCapture {
             : "0x" + String(decryptorVTable, radix: 16)
         if decryptorVTable == 0 {
             DownloadLogger.shared.log(
-                "AUDIO-KEY-SCAN provider vtable unavailable — decryptor check disabled"
+                "AUDIO-KEY-SCAN provider vtable unavailable — vtable anchor disabled, keeping the +0x1c0 signature"
             )
         }
 
@@ -115,6 +123,7 @@ final class NativeAudioKeyCapture {
         var regionCount: UInt32 = 0
         var candidateCount: UInt32 = 0
         var vtableCount: UInt32 = 0
+        var playerCount: UInt32 = 0
 
         let status: Int32 = rawKeys.withUnsafeMutableBufferPointer { buffer in
             EeveeScanPlayerAudioKeys(
@@ -127,7 +136,8 @@ final class NativeAudioKeyCapture {
                 &scannedBytes,
                 &regionCount,
                 &candidateCount,
-                &vtableCount
+                &vtableCount,
+                &playerCount
             )
         }
 
@@ -136,7 +146,7 @@ final class NativeAudioKeyCapture {
 
         guard status == 0 else {
             DownloadLogger.shared.log(
-                "AUDIO-KEY-SCAN failed status=\(status) scanned=\(scannedBytes)B regions=\(regionCount) candidates=\(candidateCount) vtableHits=\(vtableCount) vtable=\(decryptorVTableText) elapsed=\(elapsedText)s"
+                "AUDIO-KEY-SCAN failed status=\(status) scanned=\(scannedBytes)B regions=\(regionCount) candidates=\(candidateCount) vtableHits=\(vtableCount) players=\(playerCount) vtable=\(decryptorVTableText) elapsed=\(elapsedText)s"
             )
             return latestKeys()
         }
@@ -162,7 +172,7 @@ final class NativeAudioKeyCapture {
 
         let hex = found.map { $0.map { String(format: "%02x", $0) }.joined() }
         DownloadLogger.shared.log(
-            "AUDIO-KEY-SCAN status=ok regions=\(regionCount) scanned=\(scannedBytes)B candidates=\(candidateCount) vtableHits=\(vtableCount) vtable=\(decryptorVTableText) elapsed=\(elapsedText)s keys=\(found.count) total=\(merged.count) values=\(hex)"
+            "AUDIO-KEY-SCAN status=ok regions=\(regionCount) scanned=\(scannedBytes)B candidates=\(candidateCount) vtableHits=\(vtableCount) players=\(playerCount) vtable=\(decryptorVTableText) elapsed=\(elapsedText)s keys=\(found.count) total=\(merged.count) values=\(hex)"
         )
         return merged
     }
