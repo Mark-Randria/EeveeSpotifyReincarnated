@@ -688,3 +688,86 @@ AUDIO-PUBLISH ... .m4a
 ```
 
 If `keys=0`, the entropy bound is rejecting the real key or the player was not live. If keys are found but every candidate misses, compare the playing file id with the candidate list and check whether the 320 `storage-resolve` URL actually resolved; a sanitized capture of the app's native `storage-resolve` request for `aea0...` would then be the next step.
+
+## 14. Fifth on-device key-scan run and per-field diagnostics (2026-10-28 13:06)
+
+### 14.1 What the run showed
+
+- Download of `spotify:track:2jYoHERAJLmbPEzgEq3q81` started at 13:06:52; the scan ran at 13:06:57.
+- `AUDIO-KEY-SCAN status=ok regions=989 scanned=468762624B signatures=523 players=0 active=0 elapsed=1.00s keys=9 total=9`
+- All four formats resolved (playplay extraction fixed): `AUDIO-FORMAT-PROBE selected fileId=aea0af69bd767b7f90bbc29213303adf5731e9cc format=OGG_VORBIS_320 key=16B`.
+- Every one of the 9 keys was ASCII/heap junk: `01000000…8aa9`, `6e740000…6c73`, `70726566…fb06`, `7261636b…6531`, `74657874…fd08`, `b70ae710…2517`, `eea1d9ad…cb9c`, `9a99193f…b70b`, and one more. Every CDN probe missed.
+- `signatures=523` is far above a uniform-random-byte estimate for the `[+0x580] == 1 && [+0x1c0] == 6` pair, but app memory is full of small integers, so the four bytes `06 00 00 00` are common (a few 6-valued table/state fields explain the count once ~1/256 of the following windows also have a `1` at `+0x580`). The pair is therefore a weak coincidence detector, not evidence of 523 players. The strict combination (`+0x1c4 == 16`, `+0x78 != 0`, `+0x190 == 1`) never appeared (`players=0`, `active=0`), and only 9 of the 523 had entropy-passing bytes at `+0x564`, all junk. No live keyed player was in the scanned set: either the track was not playing/unpaused during the scan, or its key state is not 6 at scan time.
+
+### 14.2 Re-checked disassembly
+
+- The first key setter `0x100e67d90` copies the old state and the new 28-byte key into `+0x550`/`+0x564`; the AES key is contiguous at `+0x564` on both the first-install and re-key paths.
+- The second install site `0x102cd86c8` sets `+0x1c0` to **3 or 6** (`csel` on the key type) and also calls `inner->setKey`. A hard `+0x1c0 == 6` gate alone therefore can miss a live player.
+- The inner key manager is a wrapper at `player+0x78`; its key variant starts at `inner+0x78`, and the variant's length field is at `inner+0x7c` (the setter copies that u32 into `player+0x1c4`). `inner+0x7c == player+0x1c4` is a semantic invariant that identifies a genuinely keyed player, independent of the key state.
+- The playback caller `0x101ccc338` passes `player+0x564` to `setKey`; its `+0x593`, `+0x594`, `+0x598 != +0x5a0`, and `+0xe0` fields remain transient ranking evidence, not hard gates.
+
+### 14.3 New scan API and diagnostics
+
+`EeveeScanPlayerAudioKeys` now takes a single `EeveeKeyScanReport *` instead of six out-parameters and reports:
+
+- `active_flag_count` — every window with `[+0x580] == 1`,
+- `key_state_histogram[0..7]` — those windows grouped by `[+0x1c0]`,
+- `signature_count` — the subset with state 6,
+- `key_length_16_count`, `inner_nonnull_count`, `state_190_1_count` — restricted to signature hits, so the log shows exactly which strict field is missing,
+- `strict_count` (all three persistent fields), `caller_count` (plus the transient caller fields),
+- `relaxed_key_count` / `relaxed_valid_count` — entropy-passing windows with `+0x1c4 == 16` and non-NULL `+0x78` under **any** key state, and the subset whose `inner+0x7c` length/type word matches the player's `+0x1c4`/`+0x1c8` copies,
+- `candidate_count`, `key_count`, and up to four `EeveeKeyProfile` rows with absolute address, state, lengths, inner pointer, transient flags, score, and key fingerprint.
+
+The hot loop accepts:
+
+1. the historical base pair (`+0x580 == 1`, `+0x1c0 == 6`), and
+2. a state-independent shape (`+0x1c4 == 16`, non-NULL `+0x78`) verified by `*(u32 *)(inner+0x7c) == +0x1c4` **and** `*(u8 *)(inner+0x80) == player[+0x1c8]`.
+
+Every entropy-passing candidate performs one `mach_vm_read_overwrite` of `inner+0x7c` (capped at 4096 reads) to verify both copied invariants. Base-pair keys are still emitted even if that read fails, preserving the fallback; relaxed candidates are emitted only when the inner length agrees. The collector keeps up to 256 candidates, ranks verified players first, and replaces the weakest entry when full. `NativeAudioKeyCapture` now allows 128 keys (the CDN probe fetches the 8 KiB prefix once and tries every key on the same bytes).
+
+`AUDIO-KEY-SCAN` logs the new counters plus `states=[…]`, and up to four `AUDIO-KEY-PROFILE` lines follow it.
+
+### 14.4 Host verification
+
+The host harness (`/tmp/opencode/scan_test/main.c`) was rewritten for the new API and 13 tests pass under ASan/UBSan:
+
+```text
+live: activeFlags=3 hist6=1 sig=1 strict=1 active=1 len16=1 inner=1 s190=1 relaxed=1 valid=1 keys=1
+inactive: activeFlags=2 sig=0 keys=0
+state3: activeFlags=3 hist3=1 sig=0 relaxed=1 valid=1 keys=1
+state3-mismatch: relaxed=1 valid=0 keys=1
+base-invalid-inner: sig=1 valid=0 keys=1
+zero: sig=1 keys=0
+one-zero: sig=1 keys=1
+duplicate: sig=2 strict=2 active=2 keys=1
+straddle: scanned=2097152 sig=1 strict=1 keys=1 addr=0x100001f00
+wrong-state noise: sig=0 relaxed=0 keys=0
+junk763: sig=764 strict=1 active=1 keys=1
+score-order: first=dead... second=137f...
+api: status=0 scanned=2097152 regions=1 activeFlags=3 ... candidates=1 keys=1 profiles=1
+ALL SCAN TESTS PASSED
+```
+
+The API-path test covers the region walk, report filling, profile extraction, validity filtering, score ordering, and key emission.
+
+### 14.5 Next gate
+
+Rebuild and, critically, **play the exact track being downloaded and leave it playing (not paused) when tapping Download**. The player object and its key must be live at scan time; downloading a track that has never been played cannot work with the native-key path.
+
+Read the next log as follows:
+
+- `states=[…]`: if index 6 is large, state-6 look-alikes dominate. If index 3 is large, state-3 players exist and the relaxed path is the one that must catch them.
+- `keyLen16=… inner=… s190=…` (among signature hits): shows which strict field the 523-like population fails.
+- `relaxed=… valid=…`: `relaxed > 0, valid = 0` means player-shaped objects exist but the inner length never matches; `valid > 0` means at least one genuinely keyed player was found and its key is in `values=[…]`.
+- `AUDIO-KEY-PROFILE` rows: `state`, `len`, `innerLen`, `valid`, `base`, and `score` identify the top candidates. A real player should show `len=16`, `innerLen=16`, `valid=1`.
+
+If `valid=0` and `signature_count=523` with `keyLen16=0`, the 523 are confirmed look-alikes and the live player was absent; ensure playback and retry before changing the scan further.
+
+Expected success path:
+
+```text
+AUDIO-KEY-SCAN status=ok ... signatures=... players=1 ... relaxed=... valid=1 ... keys=...
+AUDIO-KEY-PROFILE 1/… state=6 len=16 innerLen=16 valid=1 ...
+AUDIO-KEY-PROBE selected container=ogg ...
+AUDIO-PUBLISH ... .m4a
+```

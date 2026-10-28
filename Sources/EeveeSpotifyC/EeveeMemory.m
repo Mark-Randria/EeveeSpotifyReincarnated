@@ -86,6 +86,7 @@ int32_t EeveeReadMemory(uint64_t address,
 #define EEVEE_PLAYER_STATE_190_OFFSET    0x190u
 #define EEVEE_PLAYER_KEY_STATE_OFFSET    0x1c0u
 #define EEVEE_PLAYER_KEY_LENGTH_OFFSET   0x1c4u
+#define EEVEE_PLAYER_KEY_TYPE_OFFSET     0x1c8u
 #define EEVEE_PLAYER_KEY_OFFSET          0x564u
 #define EEVEE_PLAYER_ACTIVE_OFFSET       0x580u
 #define EEVEE_PLAYER_FLAG_593_OFFSET     0x593u
@@ -103,10 +104,36 @@ int32_t EeveeReadMemory(uint64_t address,
 // of one chunk still has its full window when the next chunk arrives.
 #define EEVEE_PLAYER_OVERLAP             EEVEE_PLAYER_WINDOW
 
-// The collector's score array is inline; keep the output list bounded so the
-// stack-resident metadata cannot overflow. 128 keys x 3 candidates x 8 KiB is
-// still a trivial amount of AES work for the probe.
-#define EEVEE_KEY_COLLECTOR_CAPACITY     128u
+// The collector's candidate array is inline; keep it bounded so the
+// stack-resident metadata cannot overflow. Every candidate that reaches it has
+// already passed the entropy check, so this is far more than a scan normally
+// produces. 256 keys x 3 candidates x 8 KiB is still a trivial amount of AES
+// work for the probe.
+#define EEVEE_KEY_COLLECTOR_CAPACITY     256u
+
+// The inner key manager is read once per entropy-passing candidate to verify
+// the setter invariant `player+0x1c4 == *(u32 *)(inner+0x7c)`. That read is a
+// mach_vm_read_overwrite syscall, so cap it defensively; a real scan performs
+// a handful of reads, not thousands.
+#define EEVEE_MAX_INNER_READS            4096u
+
+// Candidate provenance. `RELAXED` catches a live player whose `+0x1c0` state
+// is not 6 (the second key-install path writes 3 as well); the inner key
+// length makes that path safe without the state gate.
+enum {
+    EEVEE_CANDIDATE_BASE    = 1u << 0,
+    EEVEE_CANDIDATE_RELAXED = 1u << 1,
+    EEVEE_CANDIDATE_VALID   = 1u << 2,
+};
+
+// Bits packed from the transient playback-caller fields for the profile log.
+enum {
+    EEVEE_META_STATE_190    = 1u << 0,
+    EEVEE_META_FLAG_593     = 1u << 1,
+    EEVEE_META_FLAG_594     = 1u << 2,
+    EEVEE_META_BUF_PENDING  = 1u << 3,
+    EEVEE_META_E0           = 1u << 4,
+};
 
 typedef kern_return_t (*EeveeRegionRecurseFn)(vm_map_t target_task,
                                               mach_vm_address_t *address,
@@ -124,15 +151,46 @@ typedef kern_return_t (*EeveeRegionFn)(vm_map_t target_task,
                                        mach_port_t *object_name);
 
 typedef struct {
-    uint8_t *keys;          // max_keys * 16 bytes
-    uint32_t max_keys;
+    uint8_t  key[16];
+    uint64_t address;         // absolute address of the candidate window
+    uint64_t inner;           // player+0x78
+    uint32_t key_length;      // player+0x1c4
+    uint32_t inner_key_length; // low 32 bits at inner+0x7c (UINT32_MAX if unread)
+    uint32_t score;
+    uint8_t  key_state;       // low byte of player+0x1c0
+    uint8_t  meta;            // EEVEE_META_*
+    uint8_t  flags;           // EEVEE_CANDIDATE_*
+    uint8_t  reserved;
+} EeveeKeyCandidate;
+
+typedef struct {
+    EeveeKeyCandidate candidates[EEVEE_KEY_COLLECTOR_CAPACITY];
+    uint32_t max_candidates;
     uint32_t count;
-    uint32_t signature_hits; // windows with +0x580 == 1 and +0x1c0 == 6
-    uint32_t strict_hits;    // signature hits with keyLength/inner/+0x190
-    uint32_t active_hits;    // strict hits with the transient caller fields
-    uint32_t player_hits;    // high-entropy keys contributed
-    uint32_t scores[EEVEE_KEY_COLLECTOR_CAPACITY];
+    uint32_t inner_reads;
+    uint32_t active_flag_hits;    // windows with [+0x580] == 1
+    uint32_t signature_hits;      // active flag + keyState == 6
+    uint32_t key_length_16_hits;  // signature hits with [+0x1c4] == 16
+    uint32_t inner_nonnull_hits;  // signature hits with a non-NULL +0x78
+    uint32_t state_190_1_hits;    // signature hits with [+0x190] == 1
+    uint32_t strict_hits;         // signature hits with all three fields above
+    uint32_t active_hits;         // strict hits + transient caller fields
+    uint32_t relaxed_key_hits;    // entropy keys with keyLength 16 + inner
+    uint32_t relaxed_valid_hits;  // relaxed hits whose inner length/type word agrees
+    uint32_t key_state_histogram[8];
 } EeveeKeyCollector;
+
+static uint32_t eevee_read_u32(const uint8_t *p) {
+    uint32_t value = 0;
+    memcpy(&value, p, sizeof(value));
+    return value;
+}
+
+static uint64_t eevee_read_u64(const uint8_t *p) {
+    uint64_t value = 0;
+    memcpy(&value, p, sizeof(value));
+    return value;
+}
 
 /// The live player pair is common on a pointer-dense heap. Integer/pointer
 /// pairs such as `00000000000000000000000002000000` are not AES keys: a real
@@ -159,64 +217,85 @@ static int eevee_key_looks_random(const uint8_t *key) {
     return zero_count <= 4 && distinct >= 8;
 }
 
-/// Adds a high-entropy 16-byte key with a confidence score unless it is
-/// already present. A duplicate keeps the highest score. Returns 1 when the
-/// key was appended, 0 otherwise.
-static int eevee_collect_key(EeveeKeyCollector *collector,
-                             const uint8_t *key,
-                             uint32_t score) {
-    uint32_t capacity = collector->max_keys < EEVEE_KEY_COLLECTOR_CAPACITY
-                            ? collector->max_keys
+/// Adds a candidate unless its key is already present. A duplicate merges the
+/// provenance flags and keeps the highest score/most useful fields. When the
+/// array is full the lowest-scoring candidate is replaced, so an early pile of
+/// weak hits cannot hide a later live player. Returns 1 when the array gained
+/// an entry, 0 otherwise.
+static int eevee_add_candidate(EeveeKeyCollector *collector,
+                               const EeveeKeyCandidate *candidate) {
+    uint32_t capacity = collector->max_candidates < EEVEE_KEY_COLLECTOR_CAPACITY
+                            ? collector->max_candidates
                             : EEVEE_KEY_COLLECTOR_CAPACITY;
-    if (collector->count >= capacity) {
-        return 0;
-    }
-    if (!eevee_key_looks_random(key)) {
+    if (capacity == 0) {
         return 0;
     }
 
     for (uint32_t i = 0; i < collector->count; i++) {
-        if (memcmp(collector->keys + i * 16, key, 16) == 0) {
-            if (score > collector->scores[i]) {
-                collector->scores[i] = score;
-            }
-            return 0;
+        EeveeKeyCandidate *existing = &collector->candidates[i];
+        if (memcmp(existing->key, candidate->key, 16) != 0) {
+            continue;
         }
+        existing->flags |= candidate->flags;
+        if (candidate->score > existing->score) {
+            existing->score = candidate->score;
+        }
+        if (candidate->inner != 0 && existing->inner == 0) {
+            existing->inner = candidate->inner;
+            existing->inner_key_length = candidate->inner_key_length;
+            existing->meta = candidate->meta;
+            existing->key_length = candidate->key_length;
+            existing->key_state = candidate->key_state;
+        }
+        return 0;
     }
 
-    memcpy(collector->keys + collector->count * 16, key, 16);
-    collector->scores[collector->count] = score;
-    collector->count++;
+    if (collector->count < capacity) {
+        collector->candidates[collector->count++] = *candidate;
+        return 1;
+    }
+
+    uint32_t weakest = 0;
+    for (uint32_t i = 1; i < collector->count; i++) {
+        if (collector->candidates[i].score < collector->candidates[weakest].score) {
+            weakest = i;
+        }
+    }
+    if (candidate->score <= collector->candidates[weakest].score) {
+        return 0;
+    }
+    collector->candidates[weakest] = *candidate;
     return 1;
 }
 
 /// Stable descending-score order so the most player-like key is probed first.
-/// The key list is small (<=128), so insertion sort is sufficient and avoids
-/// another allocation in the scan path.
-static void eevee_sort_keys_by_score(EeveeKeyCollector *collector) {
+/// The candidate list is small (<=256), so insertion sort is sufficient and
+/// avoids another allocation in the scan path.
+static void eevee_sort_candidates_by_score(EeveeKeyCollector *collector) {
     for (uint32_t i = 1; i < collector->count; i++) {
-        uint8_t key[16];
-        memcpy(key, collector->keys + i * 16, 16);
-        uint32_t score = collector->scores[i];
+        EeveeKeyCandidate candidate = collector->candidates[i];
         uint32_t j = i;
 
-        while (j > 0 && collector->scores[j - 1] < score) {
-            memcpy(collector->keys + j * 16,
-                   collector->keys + (j - 1) * 16,
-                   16);
-            collector->scores[j] = collector->scores[j - 1];
+        while (j > 0 && collector->candidates[j - 1].score < candidate.score) {
+            collector->candidates[j] = collector->candidates[j - 1];
             j--;
         }
-
-        memcpy(collector->keys + j * 16, key, 16);
-        collector->scores[j] = score;
+        collector->candidates[j] = candidate;
     }
 }
 
-/// Hot loop: find the live player object by its key-install pair, score the
-/// stronger setter/caller fields, and copy the finished AES key from +0x564.
+/// Hot loop: match either the key-install pair (`+0x580 == 1`,
+/// `+0x1c0 == 6`) or the layout-independent shape (`+0x580 == 1`,
+/// `+0x1c4 == 16`, non-NULL `+0x78`), score the setter/caller fields, and copy
+/// the finished AES key from `+0x564`.
+///
+/// `base_address` is the absolute address of `buffer[0]`; it is only used for
+/// the profile log. Every entropy-passing candidate is checked against the
+/// setter invariant `player+0x1c4 == *(u32 *)(inner+0x7c)`, which proves the
+/// object is a keyed player even when `+0x1c0` is not 6.
 static void eevee_scan_player_buffer(const uint8_t *buffer,
                                      uint64_t length,
+                                     uint64_t base_address,
                                      EeveeKeyCollector *collector) {
     if (length < EEVEE_PLAYER_WINDOW) {
         return;
@@ -228,58 +307,95 @@ static void eevee_scan_player_buffer(const uint8_t *buffer,
         if (buffer[offset + EEVEE_PLAYER_ACTIVE_OFFSET] != 1) {
             continue;
         }
+        collector->active_flag_hits++;
 
-        uint32_t key_state = 0;
-        memcpy(&key_state,
-               buffer + offset + EEVEE_PLAYER_KEY_STATE_OFFSET,
-               sizeof(key_state));
-        if (key_state != EEVEE_PLAYER_KEY_STATE_READY) {
+        uint32_t key_state =
+            eevee_read_u32(buffer + offset + EEVEE_PLAYER_KEY_STATE_OFFSET);
+        if (key_state < 8u) {
+            collector->key_state_histogram[key_state]++;
+        }
+
+        uint32_t key_length =
+            eevee_read_u32(buffer + offset + EEVEE_PLAYER_KEY_LENGTH_OFFSET);
+        uint64_t inner =
+            eevee_read_u64(buffer + offset + EEVEE_PLAYER_INNER_OFFSET);
+
+        int base = key_state == EEVEE_PLAYER_KEY_STATE_READY;
+        int relaxed = key_length == 16u && inner != 0;
+        if (!base && !relaxed) {
             continue;
         }
 
-        collector->signature_hits++;
-
-        uint32_t key_length = 0;
-        memcpy(&key_length,
-               buffer + offset + EEVEE_PLAYER_KEY_LENGTH_OFFSET,
-               sizeof(key_length));
-
-        uint64_t inner = 0;
-        memcpy(&inner,
-               buffer + offset + EEVEE_PLAYER_INNER_OFFSET,
-               sizeof(inner));
-
         uint8_t state_190 = buffer[offset + EEVEE_PLAYER_STATE_190_OFFSET];
-        int strict = key_length == 16u && inner != 0 && state_190 == 1;
-        if (strict) {
-            collector->strict_hits++;
-        }
-
+        uint8_t key_type = buffer[offset + EEVEE_PLAYER_KEY_TYPE_OFFSET];
         uint8_t flag_593 = buffer[offset + EEVEE_PLAYER_FLAG_593_OFFSET];
         uint8_t flag_594 = buffer[offset + EEVEE_PLAYER_FLAG_594_OFFSET];
+        uint64_t buffer_start =
+            eevee_read_u64(buffer + offset + EEVEE_PLAYER_BUF_START_OFFSET);
+        uint64_t buffer_end =
+            eevee_read_u64(buffer + offset + EEVEE_PLAYER_BUF_END_OFFSET);
+        uint64_t e0 =
+            eevee_read_u64(buffer + offset + EEVEE_PLAYER_E0_OFFSET);
 
-        uint64_t buffer_start = 0;
-        uint64_t buffer_end = 0;
-        uint64_t e0 = 0;
-        memcpy(&buffer_start,
-               buffer + offset + EEVEE_PLAYER_BUF_START_OFFSET,
-               sizeof(buffer_start));
-        memcpy(&buffer_end,
-               buffer + offset + EEVEE_PLAYER_BUF_END_OFFSET,
-               sizeof(buffer_end));
-        memcpy(&e0,
-               buffer + offset + EEVEE_PLAYER_E0_OFFSET,
-               sizeof(e0));
+        if (base) {
+            collector->signature_hits++;
+            if (key_length == 16u) collector->key_length_16_hits++;
+            if (inner != 0) collector->inner_nonnull_hits++;
+            if (state_190 == 1) collector->state_190_1_hits++;
 
-        int active = strict && flag_593 == 1 && flag_594 == 1
-            && buffer_start != buffer_end && e0 != 0;
-        if (active) {
-            collector->active_hits++;
+            int strict = key_length == 16u && inner != 0 && state_190 == 1;
+            if (strict) {
+                collector->strict_hits++;
+            }
+            int active = strict && flag_593 == 1 && flag_594 == 1
+                && buffer_start != buffer_end && e0 != 0;
+            if (active) {
+                collector->active_hits++;
+            }
         }
 
-        // Ranking evidence only: the key-length/inner/state checks are
-        // persistent after the setter, while the playback-caller fields can be
-        // transient between decrypt calls.
+        // A real key is 16 random bytes. The CDN probe rejects a stale key
+        // from another track; the entropy check keeps the probe list bounded.
+        const uint8_t *key = buffer + offset + EEVEE_PLAYER_KEY_OFFSET;
+        if (!eevee_key_looks_random(key)) {
+            continue;
+        }
+
+        uint32_t inner_key_length = UINT32_MAX;
+        int inner_type_matches = 0;
+        if (inner != 0 && collector->inner_reads < EEVEE_MAX_INNER_READS) {
+            collector->inner_reads++;
+            uint64_t raw = 0;
+            uint64_t got = 0;
+            // The setter reads an unaligned u64 at inner+0x7c and stores the
+            // low 32 bits (key length) at +0x1c4 and the next byte (key type)
+            // at +0x1c8 on the player. Reading the same 8 bytes here verifies
+            // both copies, which makes this a strong player identity check
+            // rather than a look-alike heuristic.
+            if (EeveeReadMemory(inner + 0x7cu,
+                                sizeof(raw),
+                                &raw,
+                                &got) == 0
+                && got == sizeof(raw)) {
+                inner_key_length = (uint32_t)(raw & 0xFFFFFFFFu);
+                inner_type_matches =
+                    (uint8_t)((raw >> 32) & 0xFFu) == key_type;
+            }
+        }
+        int valid = key_length != 0
+            && inner_key_length == key_length
+            && inner_type_matches;
+
+        if (relaxed) {
+            collector->relaxed_key_hits++;
+            if (valid) {
+                collector->relaxed_valid_hits++;
+            }
+        }
+
+        // Ranking evidence: persistent setter fields dominate, the transient
+        // playback-caller fields only break ties. A verified inner length/type
+        // word is the strongest single signal.
         uint32_t score = 1;
         if (key_length == 16u) score += 8;
         if (inner != 0) score += 4;
@@ -288,16 +404,26 @@ static void eevee_scan_player_buffer(const uint8_t *buffer,
         if (flag_594 == 1) score += 2;
         if (buffer_start != buffer_end) score += 2;
         if (e0 != 0) score += 2;
+        if (base) score += 16;
+        if (valid) score += 32;
 
-        // The first 16 bytes at +0x564 are exactly the AES key that the
-        // playback caller passes to the decryptor. A stale or low-entropy key
-        // is dropped by the collector; the CDN probe rejects a key from
-        // another track if one is still resident.
-        if (eevee_collect_key(collector,
-                              buffer + offset + EEVEE_PLAYER_KEY_OFFSET,
-                              score)) {
-            collector->player_hits++;
-        }
+        EeveeKeyCandidate candidate = {0};
+        memcpy(candidate.key, key, 16);
+        candidate.address = base_address + offset;
+        candidate.inner = inner;
+        candidate.key_length = key_length;
+        candidate.inner_key_length = inner_key_length;
+        candidate.score = score;
+        candidate.key_state = (uint8_t)key_state;
+        candidate.flags = (uint8_t)((base ? EEVEE_CANDIDATE_BASE : 0)
+                                    | (relaxed ? EEVEE_CANDIDATE_RELAXED : 0)
+                                    | (valid ? EEVEE_CANDIDATE_VALID : 0));
+        if (state_190 == 1) candidate.meta |= EEVEE_META_STATE_190;
+        if (flag_593 == 1) candidate.meta |= EEVEE_META_FLAG_593;
+        if (flag_594 == 1) candidate.meta |= EEVEE_META_FLAG_594;
+        if (buffer_start != buffer_end) candidate.meta |= EEVEE_META_BUF_PENDING;
+        if (e0 != 0) candidate.meta |= EEVEE_META_E0;
+        eevee_add_candidate(collector, &candidate);
     }
 }
 
@@ -344,7 +470,11 @@ static uint64_t eevee_scan_range(uint64_t start,
         }
 
         uint64_t available = carried + got;
-        eevee_scan_player_buffer(buffer, available, collector);
+        // `buffer[0]` is the first carried byte, i.e. `position - carried`.
+        eevee_scan_player_buffer(buffer,
+                                 available,
+                                 position - carried,
+                                 collector);
 
         uint64_t keep = available < (uint64_t)EEVEE_PLAYER_OVERLAP
                             ? available
@@ -510,29 +640,9 @@ int32_t EeveeScanPlayerAudioKeys(uint64_t max_scan_bytes,
                                  uint64_t max_duration_ms,
                                  uint8_t *out_keys,
                                  uint32_t max_keys,
-                                 uint32_t *out_key_count,
-                                 uint64_t *out_scanned_bytes,
-                                 uint32_t *out_region_count,
-                                 uint32_t *out_signature_count,
-                                 uint32_t *out_player_count,
-                                 uint32_t *out_active_count) {
-    if (out_key_count != NULL) {
-        *out_key_count = 0;
-    }
-    if (out_scanned_bytes != NULL) {
-        *out_scanned_bytes = 0;
-    }
-    if (out_region_count != NULL) {
-        *out_region_count = 0;
-    }
-    if (out_signature_count != NULL) {
-        *out_signature_count = 0;
-    }
-    if (out_player_count != NULL) {
-        *out_player_count = 0;
-    }
-    if (out_active_count != NULL) {
-        *out_active_count = 0;
+                                 EeveeKeyScanReport *out_report) {
+    if (out_report != NULL) {
+        memset(out_report, 0, sizeof(*out_report));
     }
     if (out_keys == NULL || max_keys == 0) {
         return EEVEE_KEY_SCAN_INVALID_ARGUMENT;
@@ -564,10 +674,9 @@ int32_t EeveeScanPlayerAudioKeys(uint64_t max_scan_bytes,
     }
 
     EeveeKeyCollector collector = {0};
-    collector.keys = out_keys;
-    collector.max_keys = max_keys < EEVEE_KEY_COLLECTOR_CAPACITY
-                             ? max_keys
-                             : EEVEE_KEY_COLLECTOR_CAPACITY;
+    collector.max_candidates = max_keys < EEVEE_KEY_COLLECTOR_CAPACITY
+                                   ? max_keys
+                                   : EEVEE_KEY_COLLECTOR_CAPACITY;
 
     uint32_t regions = 0;
     EeveeRangeScan scan = {
@@ -587,25 +696,91 @@ int32_t EeveeScanPlayerAudioKeys(uint64_t max_scan_bytes,
         return status;
     }
 
-    eevee_sort_keys_by_score(&collector);
+    // Profiles are taken before filtering so a rejected relaxed candidate still
+    // shows its row in the log; only the highest-scoring few are kept.
+    if (out_report != NULL) {
+        uint32_t profile_count = 0;
+        uint32_t consumed[EEVEE_KEY_PROFILE_CAPACITY] = {0};
+        while (profile_count < EEVEE_KEY_PROFILE_CAPACITY) {
+            uint32_t best = UINT32_MAX;
+            for (uint32_t i = 0; i < collector.count; i++) {
+                int skip = 0;
+                for (uint32_t k = 0; k < profile_count; k++) {
+                    if (consumed[k] == i) {
+                        skip = 1;
+                        break;
+                    }
+                }
+                if (skip) {
+                    continue;
+                }
+                if (best == UINT32_MAX
+                    || collector.candidates[i].score
+                        > collector.candidates[best].score) {
+                    best = i;
+                }
+            }
+            if (best == UINT32_MAX) {
+                break;
+            }
+            consumed[profile_count] = best;
+            EeveeKeyCandidate *c = &collector.candidates[best];
+            EeveeKeyProfile *profile = &out_report->profiles[profile_count++];
+            profile->address = c->address;
+            profile->inner = c->inner;
+            profile->key_length = c->key_length;
+            profile->inner_key_length = c->inner_key_length;
+            profile->score = c->score;
+            profile->key_state = c->key_state;
+            profile->state_190 = (c->meta & EEVEE_META_STATE_190) != 0;
+            profile->flag_593 = (c->meta & EEVEE_META_FLAG_593) != 0;
+            profile->flag_594 = (c->meta & EEVEE_META_FLAG_594) != 0;
+            profile->buffer_pending = (c->meta & EEVEE_META_BUF_PENDING) != 0;
+            profile->has_first_buffer = (c->meta & EEVEE_META_E0) != 0;
+            profile->base_hit = (c->flags & EEVEE_CANDIDATE_BASE) != 0;
+            profile->inner_valid = (c->flags & EEVEE_CANDIDATE_VALID) != 0;
+            memcpy(profile->key, c->key, 16);
+        }
+        out_report->profile_count = profile_count;
+        out_report->scanned_bytes = scan.scanned;
+        out_report->region_count = regions;
+        out_report->active_flag_count = collector.active_flag_hits;
+        out_report->signature_count = collector.signature_hits;
+        out_report->key_length_16_count = collector.key_length_16_hits;
+        out_report->inner_nonnull_count = collector.inner_nonnull_hits;
+        out_report->state_190_1_count = collector.state_190_1_hits;
+        out_report->strict_count = collector.strict_hits;
+        out_report->caller_count = collector.active_hits;
+        out_report->relaxed_key_count = collector.relaxed_key_hits;
+        out_report->relaxed_valid_count = collector.relaxed_valid_hits;
+        out_report->candidate_count = collector.count;
+        memcpy(out_report->key_state_histogram,
+               collector.key_state_histogram,
+               sizeof(out_report->key_state_histogram));
+    }
 
-    if (out_key_count != NULL) {
-        *out_key_count = collector.count;
+    // Emit only players whose inner key length/type word agrees with the
+    // player's copies at +0x1c4/+0x1c8, plus base-pair hits (the historical
+    // path, kept as a fallback in case an older object layout does not expose
+    // inner+0x7c).
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < collector.count; i++) {
+        EeveeKeyCandidate *c = &collector.candidates[i];
+        if ((c->flags & EEVEE_CANDIDATE_BASE) == 0
+            && (c->flags & EEVEE_CANDIDATE_VALID) == 0) {
+            continue;
+        }
+        collector.candidates[kept++] = *c;
     }
-    if (out_scanned_bytes != NULL) {
-        *out_scanned_bytes = scan.scanned;
+    collector.count = kept;
+    eevee_sort_candidates_by_score(&collector);
+
+    uint32_t emitted = collector.count < max_keys ? collector.count : max_keys;
+    for (uint32_t i = 0; i < emitted; i++) {
+        memcpy(out_keys + i * 16, collector.candidates[i].key, 16);
     }
-    if (out_region_count != NULL) {
-        *out_region_count = regions;
-    }
-    if (out_signature_count != NULL) {
-        *out_signature_count = collector.signature_hits;
-    }
-    if (out_player_count != NULL) {
-        *out_player_count = collector.strict_hits;
-    }
-    if (out_active_count != NULL) {
-        *out_active_count = collector.active_hits;
+    if (out_report != NULL) {
+        out_report->key_count = emitted;
     }
     return EEVEE_KEY_SCAN_OK;
 }

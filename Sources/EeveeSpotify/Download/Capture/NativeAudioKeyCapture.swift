@@ -36,16 +36,17 @@ import MachO
 /// vtable check is needed (playback builds its decryptor on the stack, so
 /// vtable hits belong to unrelated/transient objects).
 ///
-/// `EeveeScanPlayerAudioKeys` is syscall-free in its hot loop. It walks
-/// readable+writable memory once, matching the `+0x580 == 1 && +0x1c0 == 6`
-/// player pair and copying the key from `+0x564`. The pair alone is too loose
-/// on a pointer-dense heap: the first on-device run collected 32 integer /
-/// pointer windows before reaching the real player. The scan now hard-rejects
-/// low-entropy keys and ranks surviving keys using the key setter's
-/// `+0x1c4 == 16` / `+0x78 != NULL` fields plus the playback caller's
-/// `+0x190`, `+0x593`, `+0x594`, `+0x598 != +0x5a0`, and `+0xe0` checks.
-/// The download path then checks every key against the encrypted CDN prefix,
-/// so a stale key from another track is discarded automatically.
+/// `EeveeScanPlayerAudioKeys` walks readable+writable memory once. It matches
+/// the `+0x580 == 1 && +0x1c0 == 6` player pair, and also a state-independent
+/// shape (`+0x1c4 == 16` plus a non-NULL `+0x78`) whose inner key length at
+/// `inner+0x7c` is verified to equal `+0x1c4`. The second form is required
+/// because 9.1.70's other key-install path writes state 3 as well as 6. Keys
+/// that do not look like random 16-byte material are dropped; surviving keys
+/// are ranked by the key setter's `+0x1c4 == 16` / `+0x78 != NULL` fields plus
+/// the playback caller's `+0x190`, `+0x593`, `+0x594`, `+0x598 != +0x5a0`, and
+/// `+0xe0` checks. The download path then checks every key against the
+/// encrypted CDN prefix, so a stale key from another track is discarded
+/// automatically.
 ///
 /// Capture is a read-only memory scan; no code page is ever written.
 final class NativeAudioKeyCapture {
@@ -69,12 +70,12 @@ final class NativeAudioKeyCapture {
     ]
 
     /// Bounds the scan so a download tap cannot pin a CPU core indefinitely.
-    /// The budget is per scan and deliberately generous: the hot loop performs
-    /// no syscalls, so a full walk costs well under a second, and a large
-    /// writable footprint must not hide the player object behind the cutoff.
+    /// The budget is per scan and deliberately generous: the window walk costs
+    /// well under a second for the app's ~500 MB writable footprint, and a
+    /// large footprint must not hide the player object behind the cutoff.
     private static let scanByteBudget: UInt64 = 1024 * 1024 * 1024
     private static let scanTimeBudget: UInt64 = 8_000
-    private static let maxKeys = 64
+    private static let maxKeys = 128
 
     private let lock = NSLock()
     /// Newest first. Bounded so a long session cannot grow without limit.
@@ -97,12 +98,7 @@ final class NativeAudioKeyCapture {
 
         let startedAt = CFAbsoluteTimeGetCurrent()
         var rawKeys = [UInt8](repeating: 0, count: Self.maxKeys * 16)
-        var keyCount: UInt32 = 0
-        var scannedBytes: UInt64 = 0
-        var regionCount: UInt32 = 0
-        var signatureCount: UInt32 = 0
-        var playerCount: UInt32 = 0
-        var activeCount: UInt32 = 0
+        var report = EeveeKeyScanReport()
 
         let status: Int32 = rawKeys.withUnsafeMutableBufferPointer { buffer in
             EeveeScanPlayerAudioKeys(
@@ -110,28 +106,35 @@ final class NativeAudioKeyCapture {
                 Self.scanTimeBudget,
                 buffer.baseAddress,
                 UInt32(Self.maxKeys),
-                &keyCount,
-                &scannedBytes,
-                &regionCount,
-                &signatureCount,
-                &playerCount,
-                &activeCount
+                &report
             )
         }
 
         let elapsed = CFAbsoluteTimeGetCurrent() - startedAt
         let elapsedText = String(format: "%.2f", elapsed)
 
+        let histogram = [
+            report.key_state_histogram.0,
+            report.key_state_histogram.1,
+            report.key_state_histogram.2,
+            report.key_state_histogram.3,
+            report.key_state_histogram.4,
+            report.key_state_histogram.5,
+            report.key_state_histogram.6,
+            report.key_state_histogram.7,
+        ].map(String.init).joined(separator: ",")
+
         guard status == 0 else {
+            Self.profileSummary(report).forEach { DownloadLogger.shared.log($0) }
             DownloadLogger.shared.log(
-                "AUDIO-KEY-SCAN failed status=\(status) scanned=\(scannedBytes)B regions=\(regionCount) signatures=\(signatureCount) players=\(playerCount) active=\(activeCount) elapsed=\(elapsedText)s"
+                "AUDIO-KEY-SCAN failed status=\(status) scanned=\(report.scanned_bytes)B regions=\(report.region_count) activeFlags=\(report.active_flag_count) states=[\(histogram)] signatures=\(report.signature_count) players=\(report.strict_count) active=\(report.caller_count) elapsed=\(elapsedText)s"
             )
             return latestKeys()
         }
 
         var found: [Data] = []
-        found.reserveCapacity(Int(keyCount))
-        for index in 0..<Int(keyCount) {
+        found.reserveCapacity(Int(report.key_count))
+        for index in 0..<Int(report.key_count) {
             let start = index * 16
             found.append(Data(rawKeys[start ..< start + 16]))
         }
@@ -160,10 +163,42 @@ final class NativeAudioKeyCapture {
         } else {
             valuesText = "[" + fingerprints.joined(separator: ", ") + "]"
         }
+        let profileLines = Self.profileSummary(report)
+        profileLines.forEach { DownloadLogger.shared.log($0) }
+
         DownloadLogger.shared.log(
-            "AUDIO-KEY-SCAN status=ok regions=\(regionCount) scanned=\(scannedBytes)B signatures=\(signatureCount) players=\(playerCount) active=\(activeCount) elapsed=\(elapsedText)s keys=\(found.count) total=\(merged.count) values=\(valuesText)"
+            "AUDIO-KEY-SCAN status=ok regions=\(report.region_count) scanned=\(report.scanned_bytes)B activeFlags=\(report.active_flag_count) states=[\(histogram)] signatures=\(report.signature_count) keyLen16=\(report.key_length_16_count) inner=\(report.inner_nonnull_count) s190=\(report.state_190_1_count) players=\(report.strict_count) active=\(report.caller_count) relaxed=\(report.relaxed_key_count) valid=\(report.relaxed_valid_count) candidates=\(report.candidate_count) elapsed=\(elapsedText)s keys=\(found.count) total=\(merged.count) values=\(valuesText)"
         )
         return merged
+    }
+
+    /// Formats the highest-scoring player-shaped windows. Only the top four are
+    /// reported; each row carries enough fields to tell which part of the
+    /// assumed layout is wrong on the next run.
+    private static func profileSummary(_ report: EeveeKeyScanReport) -> [String] {
+        let profileLimit = Int(report.profile_count)
+        let count = min(profileLimit, 4)
+        guard count > 0 else { return [] }
+
+        let profiles: [EeveeKeyProfile] = withUnsafeBytes(of: report.profiles) { raw in
+            let bound = raw.bindMemory(to: EeveeKeyProfile.self)
+            return Array(bound.prefix(count))
+        }
+
+        return profiles.enumerated().map { index, profile in
+            let key = withUnsafeBytes(of: profile.key) { Data($0) }
+            let innerLength = profile.inner_key_length == UInt32.max
+                ? "unreadable"
+                : String(profile.inner_key_length)
+            let base = profile.base_hit != 0 ? 1 : 0
+            let valid = profile.inner_valid != 0 ? 1 : 0
+            let state190 = profile.state_190 != 0 ? 1 : 0
+            let flag593 = profile.flag_593 != 0 ? 1 : 0
+            let flag594 = profile.flag_594 != 0 ? 1 : 0
+            let pending = profile.buffer_pending != 0 ? 1 : 0
+            let firstBuffer = profile.has_first_buffer != 0 ? 1 : 0
+            return "AUDIO-KEY-PROFILE \(index + 1)/\(count) addr=0x\(String(profile.address, radix: 16)) base=\(base) state=\(profile.key_state) len=\(profile.key_length) inner=0x\(String(profile.inner, radix: 16)) innerLen=\(innerLength) valid=\(valid) s190=\(state190) f593=\(flag593) f594=\(flag594) pending=\(pending) e0=\(firstBuffer) score=\(profile.score) key=\(key.eeveeKeyFingerprint)"
+        }
     }
 
     /// Keys already discovered without triggering a new scan.

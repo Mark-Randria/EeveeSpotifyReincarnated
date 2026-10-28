@@ -428,7 +428,16 @@ final class DownloadManager {
             setState(.finished(finalURL))
         }
         catch let error {
-            setState(.failed(DownloadManager.describe(error)))
+            if let cdnError = error as? SpotifyCDNClient.CDNError,
+               case .noValidAudioKey = cdnError {
+                // The heap scan only sees keys for tracks the app has actually
+                // loaded into a player. A key from another track (or another
+                // quality) cannot decrypt this stream, so point at the usual
+                // cause instead of surfacing a generic crypto error.
+                setState(.failed("Audio key did not match — play this exact track, keep it playing, then tap Download again"))
+            } else {
+                setState(.failed(DownloadManager.describe(error)))
+            }
         }
     }
 
