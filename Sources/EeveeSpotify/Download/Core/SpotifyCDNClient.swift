@@ -384,18 +384,25 @@ final class SpotifyCDNClient {
     /// produces a real container header; wrong keys produce high-entropy bytes
     /// and are discarded.
     private static func selectKey(encryptedProbe: Data, keys: [Data]) -> KeySelection? {
+        // A full miss log for every key would be dozens of lines per candidate
+        // and would write the finished AES key to disk. Log fingerprints for
+        // the first few misses only, then a single summary.
+        let maxLoggedMisses = 8
+        var loggedMisses = 0
+        var missCount = 0
+
         for key in keys {
             do {
                 let cryptor = try StreamCTREncryptor(key: key)
                 let decrypted = try cryptor.decrypt(encryptedProbe)
                 try? cryptor.finalize()
 
-                let keyHex = key.map { String(format: "%02x", $0) }.joined()
-                let headHex = decrypted.prefix(16).map { String(format: "%02x", $0) }.joined()
+                let keyText = key.eeveeKeyFingerprint
+                let headHex = decrypted.prefix(16).eeveeHex
 
                 if let detected = detectContainer(in: decrypted) {
                     DownloadLogger.shared.log(
-                        "AUDIO-KEY-PROBE match key=\(keyHex) container=\(detected.container.rawValue) offset=\(detected.magicOffset) head=\(headHex)"
+                        "AUDIO-KEY-PROBE match key=\(keyText) container=\(detected.container.rawValue) offset=\(detected.magicOffset) head=\(headHex)"
                     )
                     return KeySelection(
                         key: key,
@@ -404,15 +411,25 @@ final class SpotifyCDNClient {
                     )
                 }
 
-                DownloadLogger.shared.log(
-                    "AUDIO-KEY-PROBE miss key=\(keyHex) head=\(headHex)"
-                )
+                missCount += 1
+                if loggedMisses < maxLoggedMisses {
+                    DownloadLogger.shared.log(
+                        "AUDIO-KEY-PROBE miss key=\(keyText) head=\(headHex)"
+                    )
+                    loggedMisses += 1
+                }
             }
             catch {
                 DownloadLogger.shared.log(
                     "AUDIO-KEY-PROBE error keyLength=\(key.count) error=\(error.localizedDescription)"
                 )
             }
+        }
+
+        if missCount > 0 {
+            DownloadLogger.shared.log(
+                "AUDIO-KEY-PROBE exhausted keys=\(keys.count) misses=\(missCount) logged=\(loggedMisses)"
+            )
         }
         return nil
     }

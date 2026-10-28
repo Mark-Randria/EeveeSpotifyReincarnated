@@ -199,16 +199,14 @@ final class DownloadManager {
                 // otherwise resolve them actively from the track metadata.
                 // All resolvable candidates are retained: the native-key probe
                 // picks the one whose bytes the app actually decrypted.
+                let capturedFileID = capture.fileID(forTrackGID: rawID)
+                    ?? capture.fileID(forTrackGID: trackID)
                 var candidates: [SpotifyAudioFileCandidate] = []
-                if let captured = capture.fileID(forTrackGID: rawID)
-                    ?? capture.fileID(forTrackGID: trackID) {
-                    candidates.append(SpotifyAudioFileCandidate(fileID: captured))
-                }
 
-                // Always ask metadata for the full candidate list. A captured
-                // file id stays first because it is the file the app is actually
-                // decrypting; the ranked metadata candidates are fallbacks when
-                // that id's CDN URL or quality no longer matches the live key.
+                // Always ask metadata for the full candidate list. Move the
+                // captured file id to the front while preserving its metadata
+                // (format/rank); prepending a bare candidate used to turn a
+                // duplicate into an `UNKNOWN` entry and skip the real format.
                 DownloadLogger.shared.log("download attempt: resolving audio files for \(trackURI)")
                 do {
                     let fetchedUnsorted = try await SpotifyAPIResolver.fetchAudioFiles(
@@ -218,14 +216,22 @@ final class DownloadManager {
                         clientToken: capture.clientToken,
                         clientID: capture.clientID
                     )
-                    let fetched = fetchedUnsorted.sorted { $0.qualityRank > $1.qualityRank }
-                    for candidate in fetched where !candidates.contains(where: { $0.fileID == candidate.fileID }) {
-                        candidates.append(candidate)
+                    var fetched = fetchedUnsorted.sorted { $0.qualityRank > $1.qualityRank }
+                    if let capturedFileID,
+                       let index = fetched.firstIndex(where: { $0.fileID == capturedFileID }) {
+                        let captured = fetched.remove(at: index)
+                        fetched.insert(captured, at: 0)
+                    } else if let capturedFileID {
+                        fetched.insert(SpotifyAudioFileCandidate(fileID: capturedFileID), at: 0)
                     }
+                    candidates = fetched
                     DownloadLogger.shared.log(
                         "AUDIO-FORMAT-PROBE track=\(trackURI) candidates=[\(candidates.map { $0.probeDescription }.joined(separator: " | "))]"
                     )
                 } catch let metadataError {
+                    if let capturedFileID {
+                        candidates = [SpotifyAudioFileCandidate(fileID: capturedFileID)]
+                    }
                     DownloadLogger.shared.log(
                         "download attempt: audio file resolve failed: \(metadataError.localizedDescription)"
                     )
@@ -247,18 +253,25 @@ final class DownloadManager {
                         "AUDIO-FORMAT-PROBE resolving fileId=\(fileId) format=\(candidate.formatName) hint=\(candidate.containerHint) drm=\(candidate.mayBeDRMProtected) rank=\(candidate.qualityRank)"
                     )
                     do {
-                        let (key, cdnURL) = try await SpotifyAPIResolver.resolveAudioStream(
+                        // The native-key path does not consume the playplay key.
+                        // Resolve the CDN URL even when playplay extraction fails
+                        // (currently OGG320): the live-player AES key can still
+                        // decrypt that file, and excluding it would make a 320
+                        // playback key unmatchable.
+                        let (playplayKey, cdnURL) = try await SpotifyAPIResolver.resolveAudioStreamForNativeKey(
                             fileId: fileId,
                             bearerToken: token,
                             baseURL: capture.spClientBaseURL,
                             clientToken: capture.clientToken,
                             clientID: capture.clientID
                         )
+                        let key = playplayKey ?? Data()
+                        let keyText = key.count == 16 ? "key=16B" : "key=native-only"
                         let cdnExtension = cdnURL.pathExtension.isEmpty
                             ? "<none>"
                             : cdnURL.pathExtension
                         DownloadLogger.shared.log(
-                            "AUDIO-FORMAT-PROBE resolvable fileId=\(fileId) format=\(candidate.formatName) key=\(key.count)B cdnExt=\(cdnExtension) cdnHost=\(cdnURL.host ?? "?")"
+                            "AUDIO-FORMAT-PROBE resolvable fileId=\(fileId) format=\(candidate.formatName) \(keyText) cdnExt=\(cdnExtension) cdnHost=\(cdnURL.host ?? "?")"
                         )
                         resolvedStreams.append(
                             (
@@ -283,8 +296,9 @@ final class DownloadManager {
                 }
 
                 if stream == nil, let resolved = resolvedStreams.first {
+                    let keyText = resolved.key.count == 16 ? "16B" : "native-only"
                     DownloadLogger.shared.log(
-                        "AUDIO-FORMAT-PROBE selected fileId=\(resolved.candidate.fileID) format=\(resolved.candidate.formatName) hint=\(resolved.candidate.containerHint) rank=\(resolved.candidate.qualityRank)"
+                        "AUDIO-FORMAT-PROBE selected fileId=\(resolved.candidate.fileID) format=\(resolved.candidate.formatName) hint=\(resolved.candidate.containerHint) rank=\(resolved.candidate.qualityRank) key=\(keyText)"
                     )
                     stream = AudioStreamCapture.AudioStream(
                         trackGID: trackID,
@@ -322,9 +336,11 @@ final class DownloadManager {
                 "AUDIO-KEY-SCAN candidates=\(nativeKeys.count) downloadCandidates=\(downloadCandidates.count)"
             )
             for candidate in downloadCandidates {
-                let playplayHex = candidate.key.map { String(format: "%02x", $0) }.joined()
+                let playplayText = candidate.key.isEmpty
+                    ? "native-only"
+                    : candidate.key.eeveeKeyFingerprint
                 DownloadLogger.shared.log(
-                    "AUDIO-KEY-CAPTURE candidate=\(candidate.label) playplay=\(playplayHex)"
+                    "AUDIO-KEY-CAPTURE candidate=\(candidate.label) playplay=\(playplayText)"
                 )
             }
 

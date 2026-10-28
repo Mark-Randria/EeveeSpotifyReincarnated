@@ -14,8 +14,11 @@ import Foundation
 /// `NSURLSessionTask.resume` hook), so even the fileId must be re-resolved
 /// actively via the extended-metadata endpoint (see `fetchAudioFiles`).
 ///
-/// The requests carry the app's own `Authorization: Bearer` token, so they are
-/// indistinguishable from the app's own traffic.
+/// The requests carry the app's own `Authorization: Bearer` token, but are
+/// tagged with `X-Eevee-Download-Resolve: 1` so the passive capture can tell
+/// them apart from the app's own playplay/storage-resolve traffic. Without the
+/// tag, each resolver request rewrote the current track's captured fileId and
+/// the next download started from the previous run's last-resolved candidate.
 enum SpotifyAPIResolver {
     enum ResolveError: LocalizedError {
         case missingToken
@@ -115,6 +118,46 @@ enum SpotifyAPIResolver {
         return (key, cdnURL)
     }
 
+    /// Resolves the CDN URL even when the playplay response cannot be parsed.
+    ///
+    /// The native-key path does not use the playplay key at all: the finished
+    /// AES key is lifted from the live player, and the CDN URL is enough to
+    /// fetch the encrypted bytes. OGG320 currently fails playplay extraction
+    /// while 160/96 succeed, but its storage-resolve entry may still exist.
+    /// Keeping that candidate is essential when the player is streaming OGG320;
+    /// otherwise the native key has no matching file to decrypt.
+    static func resolveAudioStreamForNativeKey(
+        fileId: String,
+        bearerToken: String,
+        baseURL: String,
+        clientToken: String? = nil,
+        clientID: String? = nil
+    ) async throws -> (key: Data?, cdnURL: URL) {
+        var key: Data?
+        do {
+            key = try await fetchAudioKey(
+                fileId: fileId,
+                bearerToken: bearerToken,
+                baseURL: baseURL,
+                clientToken: clientToken,
+                clientID: clientID
+            )
+        } catch {
+            DownloadLogger.shared.log(
+                "AUDIO-FORMAT-PROBE playplay unavailable fileId=\(fileId) error=\(error.localizedDescription) — keeping native-key candidate"
+            )
+        }
+
+        let cdnURL = try await fetchCDNURL(
+            fileId: fileId,
+            bearerToken: bearerToken,
+            baseURL: baseURL,
+            clientToken: clientToken,
+            clientID: clientID
+        )
+        return (key, cdnURL)
+    }
+
     // MARK: - extended-metadata (track → audio file candidates)
 
     /// Resolves the audio file candidates for a track by replaying the app's own
@@ -193,6 +236,11 @@ enum SpotifyAPIResolver {
         )
 
         guard let key = AudioKeyExtractor.extractKey(from: data) else {
+            let fields = AudioKeyExtractor.fieldSummary(data)
+            let prefix = Data(data.prefix(24)).eeveeHex
+            DownloadLogger.shared.log(
+                "AUDIO-FORMAT-PROBE playplay missing key fileId=\(fileId) bytes=\(data.count) fields=[\(fields)] prefix=\(prefix)"
+            )
             throw ResolveError.emptyKeyResponse
         }
         return key
@@ -244,6 +292,14 @@ enum SpotifyAPIResolver {
     ) async throws -> Data {
         var request = URLRequest(url: url)
         request.httpMethod = method
+        // Tag our own resolver traffic. The global NSURLSessionTask.resume hook
+        // observes every task in the app; without this marker each resolver
+        // request rewrites the captured fileId for the current track, so the
+        // next download starts with the previous run's last-resolved candidate.
+        request.setValue(
+            "1",
+            forHTTPHeaderField: AudioStreamCapture.resolverRequestHeader
+        )
         request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
         if let clientToken = clientToken, !clientToken.isEmpty {
             request.setValue(clientToken, forHTTPHeaderField: "client-token")

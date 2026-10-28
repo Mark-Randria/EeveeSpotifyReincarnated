@@ -14,10 +14,16 @@ import Foundation
 ///
 /// Strategy (defensive, never throws):
 ///   1. Proper protobuf walk: look for tag 0x0A (field 1, wire type 2)
-///      followed by varint length 16 and 16 all-non-zero bytes.
+///      followed by varint length 16 and 16 non-all-zero bytes.
 ///   2. Fallback: the original heuristic scan for ANY varint that decodes to
-///      16 immediately followed by 16 non-zero bytes (covers schemas where the
-///      key is not field 1).
+///      16 immediately followed by 16 non-all-zero bytes (covers schemas
+///      where the key is not field 1).
+///
+/// 16-byte obfuscated keys routinely contain zero bytes. The earlier
+/// `!candidate.contains(0)` check rejected a normal key with one zero byte
+/// (about 6% of random keys); that is the likely cause of the OGG320
+/// `playplay key response contained no 16-byte key` failure while 160/96
+/// happened to have no zero. Zero bytes are valid here.
 ///
 /// NOTE: Some builds wrap the key in an `obfuscated_key` field that requires
 /// per-version deobfuscation (see librespot-java playplay reversing). If the
@@ -40,7 +46,9 @@ enum AudioKeyExtractor {
     }
 
     /// Walks the protobuf for tag 0x0A (field 1, wire type 2) with a
-    /// length-prefixed payload of exactly 16 non-zero bytes.
+    /// length-prefixed payload of exactly 16 non-all-zero bytes. Zero bytes are
+    /// valid inside the obfuscated key; only an entirely zero payload is
+    /// rejected.
     private static func extractProtobufField1Key(from data: Data) -> Data? {
         var offset = 0
         while offset < data.count {
@@ -71,7 +79,7 @@ enum AudioKeyExtractor {
             }
 
             let candidate = data.subdata(in: cursor ..< cursor + 16)
-            if !candidate.contains(0) {
+            if candidate.contains(where: { $0 != 0 }) {
                 return candidate
             }
             offset += 1
@@ -80,7 +88,7 @@ enum AudioKeyExtractor {
     }
 
     /// Original spike heuristic: any varint that decodes to 16 immediately
-    /// followed by 16 all-non-zero bytes.
+    /// followed by 16 non-all-zero bytes.
     private static func extractHeuristicKey(from data: Data) -> Data? {
         var offset = 0
         while offset < data.count {
@@ -100,11 +108,80 @@ enum AudioKeyExtractor {
 
             if value == 16 && cursor + 16 <= data.count {
                 let candidate = data.subdata(in: cursor ..< cursor + 16)
-                if !candidate.contains(0) {
+                if candidate.contains(where: { $0 != 0 }) {
                     return candidate
                 }
             }
             offset += 1
+        }
+        return nil
+    }
+
+    /// Compact top-level protobuf field summary for diagnostics. Spotify's
+    /// OGG320 response failed the 16-byte extraction while the other formats
+    /// succeeded; this tells us whether the response was an error envelope, a
+    /// 32-byte key, or a 16-byte key the old zero-byte check rejected.
+    static func fieldSummary(_ data: Data) -> String {
+        var offset = 0
+        var parts: [String] = []
+
+        while offset < data.count && parts.count < 8 {
+            guard let (tag, tagEnd) = readVarint(data, at: offset) else {
+                break
+            }
+            let field = tag >> 3
+            let wire = tag & 7
+            var cursor = tagEnd
+
+            switch wire {
+            case 0:
+                guard let (value, end) = readVarint(data, at: cursor) else {
+                    return parts.joined(separator: ",")
+                }
+                parts.append("f\(field):v=\(value)")
+                cursor = end
+            case 1:
+                guard cursor + 8 <= data.count else {
+                    return parts.joined(separator: ",")
+                }
+                parts.append("f\(field):i64")
+                cursor += 8
+            case 2:
+                guard let (length, end) = readVarint(data, at: cursor),
+                      length <= UInt64(data.count - end) else {
+                    return parts.joined(separator: ",")
+                }
+                parts.append("f\(field):b=\(length)")
+                cursor = end + Int(length)
+            case 5:
+                guard cursor + 4 <= data.count else {
+                    return parts.joined(separator: ",")
+                }
+                parts.append("f\(field):i32")
+                cursor += 4
+            default:
+                return parts.joined(separator: ",")
+            }
+
+            offset = cursor
+        }
+
+        return parts.joined(separator: ",")
+    }
+
+    private static func readVarint(_ data: Data, at start: Int) -> (UInt64, Int)? {
+        var value: UInt64 = 0
+        var shift: UInt64 = 0
+        var cursor = start
+
+        while cursor < data.count && shift < 64 {
+            let byte = data[cursor]
+            value |= UInt64(byte & 0x7F) << shift
+            cursor += 1
+            if byte & 0x80 == 0 {
+                return (value, cursor)
+            }
+            shift += 7
         }
         return nil
     }
