@@ -163,9 +163,9 @@ Evidence from the 9.1.70 Mach-O (`ipa_original/Spotify_9.1.70.ipa`), confirmed b
 | Audio decrypt entry | VA `0x1069101a0`, signature `(object, streamOffset, out, in, length)`, returns void |
 | Function prologue | `ff8301d1 fa6701a9 f85f02a9 f65703a9` (`sub sp, sp, #0x60` + callee-saved pushes) |
 | Cipher | **standard AES-128-CTR** for playback (mode 0): fixed IV `72e067fbddcbcf77ebe8bc643f630d93`, counter advanced by byte offset. The custom 13-round white-box path (mode 1) is not used by playback |
-| Key setup | VA `0x103b62cc0(object, keyPtr)`; mode 0 calls `0x100ad09b0(object+0x310, keyPtr, 0x80, 1, &len)`, then sets `+0x04 = len`, `+0x08 = 1` |
+| Key setup | VA `0x103b62cc0(object, keyPtr)`; mode 0 calls `0x100ad09b0(object+0x310, …)` for the AES provider; mode 1 calls `0x102717e28(object+0x10, …)` for the white-box path; both then set `+0x04 = len`, `+0x08 = 1` |
 | Key-setter wrapper | VA `0x101231c1c`; locks `this+8`, then `setKey(this+0x78, key)` |
-| Player layout | `+0x78` -> inner object; `+0x564` key material (28 bytes, first 16 = AES key); `+0x580` active flag; `+0x593`/`+0x594` stream-ready flags; `+0x598`/`+0x5a0` buffer begin/end |
+| Player layout | `+0x78` -> inner object; `+0x1c0` key state (6 after install); `+0x564` key material (28 bytes, first 16 = AES key); `+0x580` active flag; `+0x593`/`+0x594` stream-ready flags; `+0x598`/`+0x5a0` buffer begin/end |
 | Inner object | decryptor embedded at `+0x78`: `+0x00` mode, `+0x04` key length, `+0x08` has-key, `+0x0c` mode echo, `+0x310` provider |
 | Key writer | VA `0x100e67d90`: receives the finished key, calls `setKey(inner+0x78, key)`, then stores `key[0..15]` at `player+0x564` and `key[12..27]` at `player+0x570`; sets `+0x580 = 1` |
 | Playback caller | VA `0x101ccc338`: requires `+0x580`, `+0x593`, `+0x594` == 1 and a non-empty buffer; builds a stack mode-0 decryptor, `setKey(sp, player+0x564)`, decrypts in place at offset 0 |
@@ -173,12 +173,9 @@ Evidence from the 9.1.70 Mach-O (`ipa_original/Spotify_9.1.70.ipa`), confirmed b
 
 Implementation (read-only, no code patching):
 
-- The decryptor constructor `0x104fc6b54` installs a **fixed vtable pointer** — file VA `0x10bfa5350` inside `__DATA_CONST`, so runtime value `0x10bfa5350 + slide` — at `decryptor + 0x310`, and stores `+0x08 = 1` / `+0x0c = mode` in `setKey`. That vtable is the decisive test; the header bytes alone match thousands of unrelated heap objects.
-- `EeveeScanPlayerAudioKeys` (C) is **syscall-free in its hot loop** and runs two passes over readable+writable regions (2 MiB chunks, time/byte bounded):
-  1. **Decryptor pass.** Find an 8-byte word equal to the provider vtable. A hit at address `A` means `decryptor = A - 0x310` and the host object it belongs to is `host = A - 0x388` (the player stores `host` at its own `+0x78`). A hit is accepted only when the decryptor header is live (`+0x08 == 1`, `+0x0c == +0x00`, `+0x00 <= 1`); live hosts are recorded as anchors. This pass also accepts the syscall-free secondary signature `[+0x580] == 1 && *(u32*)(+0x1c0) == 6` (the key setter writes `6` there right before installing the key) so the player can be found even without the vtable.
-  2. **Owner pass** (only when pass 1 recorded an anchor). Find an 8-byte word equal to an anchor `host`. A hit at address `B` means `player = B - 0x78`; when `[player+0x580] == 1`, the 16 bytes at `player+0x564` are the finished AES key.
-- The derived provider schedule `[+0x318]` is also read as a fallback candidate (native and word-reversed), but only while the list is less than half full so pass-2 player keys always have room.
-- There is deliberately **no weak fallback acceptance**. On the first run the provider `ready` byte plus a plausible `[+0x318]` pointer matched 16 junk windows in the first 35 MB and filled the 16-slot list, so the scan stopped long before reaching the player. Matching the vtable (or the `+0x1c0 == 6` pair) cannot be satisfied by that junk.
+- The key setter writes `+0x1c0 = 6`, calls the inner object's `setKey`, writes the key length at `+0x1c4`, copies `key[0..15]` to `player+0x564`, and sets `+0x580 = 1`. The playback caller at `0x101ccc338` requires `+0x580 == 1` and passes exactly `player+0x564` to the stack decryptor's `setKey`.
+- The decryptor constructor `0x104fc6b54` and the provider vtable `0x10bfa5350` describe **transient/other decryptor instances**, not a persistent field of the player: the playback caller builds a mode-0 decryptor on the stack for each call and destroys it afterwards. The player's `+0x78` inner object is key-management state, and its `+0x78` decryptor is not guaranteed to be the live playback decryptor at scan time. The vtable-anchored two-pass scan therefore found unrelated objects (`players=0` on-device).
+- `EeveeScanPlayerAudioKeys` (C) is syscall-free in its hot loop and walks readable+writable regions **once** (2 MiB chunks, byte/time bounded). A window is accepted when `[+0x580] == 1 && *(u32 *)(+0x1c0) == 6`; the 16 bytes at `+0x564` are appended to a deduplicated key list. No decryptor header or vtable check is required.
 - `NativeAudioKeyCapture.scanForKeys()` runs that scan away from the main thread and keeps a bounded newest-first list of keys. The prologue of `0x1069101a0` is still checked as a version/layout gate, but the address is never called or patched.
 - `DownloadManager` passes the keys to `SpotifyCDNClient`, which probes an 8 KiB encrypted prefix and keeps the key that produces a real container header. Stale keys from a previously played track are therefore rejected automatically.
 
@@ -187,6 +184,8 @@ An earlier attempt installed an Orion `FunctionHook` on `0x1069101a0`. That is a
 A first version of the scan matched only `[+0x08] == 1` and `[+0x0c] == [+0x00]` and returned 16 keys in the first 10 MB — all false positives (`02000000…`, `trackNumber`, …). The CDN probe rejected every one. The vtable check above was added so the scan can only return keys from real player decryptors.
 
 A second on-device run confirmed the layout but not the match: `AUDIO-KEY-SCAN status=ok regions=161 scanned=35241984B candidates=14684 vtableHits=0 vtable=0x12123d350 keys=16` (slide `0x15298000`). Every one of the 16 keys was heap junk (`SPTCollectionPla`, reversed strings, pointer pairs), and all probes missed. The scan again stopped at 35 MB — this time because the **provider-signature fallback** (`[+0x310+0x14] == 1` plus a plausible `[+0x318]`) filled the list before the walk reached the player. `vtableHits=0` therefore only means "the vtable was never seen in the first 35 MB", not "the vtable is wrong". That fallback was removed; both acceptance paths now have a false-positive rate near zero, so the walk runs the whole budget.
+
+A third on-device run (2026-10-28) showed the vtable anchor finding `vtableHits=13/14` but `players=0`: the hits were live decryptor headers from unrelated/stack objects, and neither the host-pointer pass nor the header-gated player signature resolved the owning player. Re-reading the key setter and playback caller confirmed the player's own fields are sufficient and stable: `+0x1c0 == 6`, `+0x580 == 1`, key at `+0x564`. The scan was simplified to a single direct pass; host tests cover active/inactive players, zero/duplicate keys, and a player straddling a chunk boundary. Cloud rebuild pending.
 
 ---
 
@@ -367,12 +366,11 @@ New files:
 
 - `Sources/EeveeSpotifyC/EeveeMemory.m` / `include/EeveeMemory.h`
   - `EeveeReadMemory`: fault-free `mach_vm_read_overwrite` wrapper.
-  - `EeveeScanPlayerAudioKeys`: read-only, two-pass, syscall-free-hot-loop player scan (§3.7), with a region/submap walk, 2 MiB chunks, time/byte budgets, and deduplicated 16-byte keys.
-  - Pass 1 anchors on the decryptor provider vtable (`0x10bfa5350 + slide`) or on the player pair `[+0x580] == 1 && [+0x1c0] == 6`; pass 2 resolves the anchor host to the owning player and reads `player+0x564`. Diagnostics: `candidates` (live decryptors), `vtableHits` (raw vtable words seen), `players` (active players whose key was read).
+  - `EeveeScanPlayerAudioKeys`: read-only, single-pass, syscall-free-hot-loop player scan (§3.7), with a region/submap walk, 2 MiB chunks, time/byte budgets, and deduplicated 16-byte keys.
+  - Matches the live-player pair `[+0x580] == 1 && [+0x1c0] == 6` and reads `player+0x564`. Diagnostics: `signatures` (matching windows), `players` (windows that contributed a nonzero key).
 - `Sources/EeveeSpotify/Download/Capture/NativeAudioKeyCapture.swift`
   - Resolves the Spotify image (never image 0) and checks the `0x1069101a0` prologue as a layout gate.
-  - Computes the runtime provider vtable from the image slide and passes it to the scan.
-  - Calls `EeveeScanPlayerAudioKeys` with a 1 GiB per-pass budget and 8 s, keeps the newest 32 keys, and logs `AUDIO-KEY-SCAN status=ok regions=… scanned=…B candidates=… vtableHits=… players=… vtable=0x… keys=… values=…`.
+  - Calls `EeveeScanPlayerAudioKeys` with a 1 GiB budget and 8 s, keeps the newest 32 keys, and logs `AUDIO-KEY-SCAN status=ok regions=… scanned=…B signatures=… players=… keys=… values=…`.
 
 Changed files:
 
@@ -468,7 +466,7 @@ On 9.1.70 passive capture is rare. The active resolver now always runs, even whe
 | storage-resolve | Reachable; returned `audio-ak.spotifycdn.com` |
 | CDN download | HTTP 200, `application/octet-stream`, ~8 MB |
 | Decryption with obfuscated playplay key | Failed: `unknown-container head=23c1443539731a1f393c4b5cec619ccf` |
-| Native key capture | Implemented (two-pass vtable scan); two on-device runs, no matching key yet — see §3.7 |
+| Native key capture | Implemented (direct player-signature scan); on-device validation pending — see §3.7 |
 | Decrypted container | — (previous attempt used the wrong key) |
 | Ogg codec | — |
 | Playback result offline | — |
@@ -513,8 +511,8 @@ On 9.1.70 passive capture is rare. The active resolver now always runs, even whe
 
 ### M2.5 acceptance detail
 
-- `AUDIO-KEY-SCAN status=ok … vtableHits=<n> players=<n> keys=<n> values=[…]` appears after tapping Download while the track is playing.
-- The scan reports `vtableHits >= 1` (or `players >= 1` via the `+0x1c0` signature) and no code page is modified (no `CODESIGNING`/`KERN_PROTECTION_FAILURE` crash).
+- `AUDIO-KEY-SCAN status=ok … signatures=<n> players=<n> keys=<n> values=[…]` appears after tapping Download while the track is playing.
+- The scan reports `signatures >= 1 && players >= 1` and no code page is modified (no `CODESIGNING`/`KERN_PROTECTION_FAILURE` crash). `signatures=0` means no live player with an installed key was present in the writable footprint.
 - Pressing Download produces `AUDIO-KEY-PROBE selected container=… offset=167` (or `offset=0`).
 - The decrypted staging file contains `OggS` at the detected offset and is stripped to start with `OggS`.
 - The resulting Ogg can be inspected/replayed locally before the M4 transcode.
@@ -559,7 +557,7 @@ If any condition fails, move to M4.
 6. **Transcoder binary size and licensing.** libvorbis is small and permissive, but still needs an iOS build and integration.
 7. **`storage-resolve` product/path parameter.** The current request uses `product=0` and the interactive audio path. MP4/EME files may require a different product or path; an `unavailable` MP4 result is not proof that the file is globally unavailable.
 8. **No build/test in this workspace.** The source changes are not compiled; the next real gate is the macOS build and the on-device probe.
-9. **Layout/address coupling.** `0x1069101a0`, `0x100e67d90`, `0x101231c1c` and the `player+0x78` / `+0x564` / `+0x580` offsets are specific to the 9.1.70 IPA. The scan still checks the decrypt-entry prologue and falls back to a multi-key probe, but a different build must be re-analyzed rather than assumed compatible.
+9. **Layout/address coupling.** `0x1069101a0`, `0x100e67d90`, `0x101231c1c` and the `player+0x1c0` / `+0x564` / `+0x580` offsets are specific to the 9.1.70 IPA. The scan still checks the decrypt-entry prologue and falls back to a multi-key probe, but a different build must be re-analyzed rather than assumed compatible.
 10. **Key/file-id association.** The app may prefetch the next track's key, and the key lives in the player object only while that track is loaded. The multi-key probe rejects wrong keys, the downloader iterates every resolved candidate, and the UI asks the user to start playback first. Keys from a previously played track are harmless.
 11. **Player object must be live.** The finished key is lifted from the live player object, so a track that was never loaded in the current session has no key to find. This is the documented Local Files UX limit ("play it first").
 11. **Transcoder size/CPU.** stb_vorbis is a single ~188 KB public-domain C file and AudioToolbox supplies the AAC encoder, so binary growth is modest. Decoding+encoding a full track costs CPU time; it runs off the main thread and is not cancellable mid-transcode yet. stb_vorbis does not support old floor-0 Vorbis files, but Spotify's streams use floor 1.
@@ -596,3 +594,4 @@ If any condition fails, move to M4.
 | 2026-10-27 | Replaced the never-valid standard AES-schedule scan with `EeveeScanPlayerAudioKeys`. It recovers the finished key at `player+0x564` by matching the live player object (`+0x580 == 1`, heap pointer at `+0x78`, decryptor header at `*[player+0x78]+0x78` with mode echo `+0x0c == +0x00` and has-key `+0x08 == 1`). Read-only, chunked, time/byte bounded, no code patching and no native calls. The existing 8 KiB probe then selects the key that belongs to the resolved candidate. Cloud rebuild and on-device validation pending. |
 | 2026-10-27 | First on-device run of the player scan: no launch crash, `AUDIO-KEY-SCAN status=ok regions=91 scanned=10059776B candidates=2098 keys=16`, but every key was a random heap object (`02000000…`, `trackNumber`, …) and all 16 probes missed. The header checks (`+0x08 == 1`, `+0x0c == +0x00`) are too weak, and stopping at 16 false keys ended the scan after 10 MB. Diagnosed the decryptor constructor `0x104fc6b54`: it writes the fixed vtable of the key-provider object (`0x10bfa5350`, `__DATA_CONST`) to `decryptor + 0x310`. That value is now the decisive match. The scan also passes the image slide in and logs `vtableHits`; the disassembly also confirms `setKey` is `0x101231c1c` (`this+0x78`), so the decryptor is `[player+0x78] + 0x78` as assumed. Cloud rebuild pending. |
 | 2026-10-28 | Second on-device run: no crash, `vtableHits=0`, `candidates=14684`, `scanned=35241984B`, 16 junk keys (`SPTCollectionPla`, reversed strings, pointer pairs), every probe missed. Root cause: the **provider-signature fallback** (`provider+0x14 == 1` plus a plausible `+0x318`) is also weak on this pointer-dense heap and filled all 16 slots at 35 MB, ending the walk before the player was reached. `vtableHits=0` therefore reflects scan coverage, not a bad constant. Rewrote the scan as two syscall-free passes: (1) match the literal vtable word (`host = A - 0x388`, validated by the live decryptor header) or the `[+0x580] == 1 && *(u32*)(+0x1c0) == 6` player pair, (2) match a pointer to an anchor host (`player = B - 0x78`, require `+0x580 == 1`, read `+0x564`). Removed every weak acceptance path, raised the key list to 32, added a `players` diagnostic and one 1 GiB/8 s budget per pass. Cloud rebuild pending. |
+| 2026-10-28 | Third on-device run: `vtableHits=13/14`, `candidates=1/2`, but `players=0` both times. Re-disassembled the key setter `0x100e67d90`, playback caller `0x101ccc338`, key setup `0x103b62cc0`, and decryptor ctor `0x104fc6b54`. Playback constructs a mode-0 decryptor **on the stack** and destroys it per call; the provider vtable hits belong to unrelated/transient decryptors, so deriving the player from them was invalid. The stable player evidence is `+0x1c0 == 6` (key installed), `+0x580 == 1` (playback allowed), and the AES key at `+0x564` (exactly what the caller passes to `setKey`). Replaced the two-pass vtable walk with a single direct player-signature scan; diagnostics are now `signatures` and `players`, the vtable parameter/`vtableHits` were removed, and host tests cover live/inactive/state0/zero-key/duplicate/chunk-straddle/noise cases. Cloud rebuild pending. |

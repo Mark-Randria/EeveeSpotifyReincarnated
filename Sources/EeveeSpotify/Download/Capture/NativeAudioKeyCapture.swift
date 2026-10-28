@@ -15,40 +15,32 @@ import MachO
 ///
 /// The app, however, stores the finished key in plaintext inside its live
 /// audio player object. Recovered layout (from the key setter at
-/// `0x100e67d90` and the decrypt-entry callers at `0x101ccc3e4` /
-/// `0x102cd86c8`):
+/// `0x100e67d90` and the playback decrypt caller at `0x101ccc338`):
 ///
 ///   struct Player {
 ///       ...
-///       void    *inner;        // +0x78 -> object embedding the decryptor
+///       void    *inner;        // +0x78  key-manager/inner object
+///       ...
+///       uint32_t keyState;     // +0x1c0 set to 6 by the key setter
+///       uint32_t keyLength;    // +0x1c4 copied from inner+0x7c
 ///       ...
 ///       uint8_t  key[28];      // +0x564 (first 16 bytes are the AES-128 key)
 ///       ...
-///       uint8_t  mode;         // +0x580
+///       uint8_t  active;       // +0x580 (1 once a key was installed)
 ///   };
 ///
-///   struct Inner {             // *inner
-///       ...
-///       uint8_t  decryptor[0x370];   // +0x78
-///       ...
-///   };
+/// The key setter writes 6 to `+0x1c0`, installs the key at `+0x564`, and sets
+/// `+0x580 = 1` before returning. The playback caller refuses to decrypt unless
+/// `+0x580 == 1` and passes exactly `player + 0x564` to the decryptor's
+/// `setKey`. Those two stable fields identify a live player; no decryptor
+/// vtable check is needed (playback builds its decryptor on the stack, so
+/// vtable hits belong to unrelated/transient objects).
 ///
-/// After `setKey()` ran, the embedded decryptor has `+0x08 == 1` (has key),
-/// `+0x0c == +0x00` (mode echo), and — the decisive test — the key provider
-/// embedded at `+0x310` starts with the fixed vtable of its class
-/// (`0x10bfa5350 + image slide`, in `__DATA_CONST`). That vtable is unique to
-/// real decryptor objects, so the weak "has-key" byte alone can no longer
-/// produce false matches.
-///
-/// `EeveeScanPlayerAudioKeys` is syscall-free in its hot loop and runs in two
-/// passes: it first walks writable memory for the literal vtable constant (a
-/// hit at `A` gives `host = A - 0x388`), then — only if it found one — walks
-/// again for a pointer to that host (`player = B - 0x78`) and reads the key at
-/// `player+0x564`. A weak signature is deliberately *not* accepted, because on
-/// this pointer-dense heap it fills the key list with junk and stops the walk
-/// before the player is ever reached. The download path then checks every key
-/// against the encrypted CDN prefix, so a stale key from another track is
-/// discarded automatically.
+/// `EeveeScanPlayerAudioKeys` is syscall-free in its hot loop. It walks
+/// readable+writable memory once, matching the `+0x580 == 1 && +0x1c0 == 6`
+/// player signature and copying the key from `+0x564`. The download path then
+/// checks every key against the encrypted CDN prefix, so a stale key from
+/// another track is discarded automatically.
 ///
 /// Capture is a read-only memory scan; no code page is ever written.
 final class NativeAudioKeyCapture {
@@ -71,16 +63,8 @@ final class NativeAudioKeyCapture {
         0xF6, 0x57, 0x03, 0xA9,
     ]
 
-    /// File (unslid) VA of the decryptor's key-provider vtable, inside
-    /// `__DATA_CONST`. The decryptor constructor (`0x104fc6b54`) writes this
-    /// value to `decryptor + 0x310`; matching it proves a scanned window really
-    /// holds a live decryptor rather than random heap bytes.
-    ///
-    /// 9.1.70 only. The prologue gate below guards the whole layout.
-    static let decryptorProviderVTableFileAddress: UInt64 = 0x10bfa5350
-
     /// Bounds the scan so a download tap cannot pin a CPU core indefinitely.
-    /// The budget is per pass and deliberately generous: the hot loop performs
+    /// The budget is per scan and deliberately generous: the hot loop performs
     /// no syscalls, so a full walk costs well under a second, and a large
     /// writable footprint must not hide the player object behind the cutoff.
     private static let scanByteBudget: UInt64 = 1024 * 1024 * 1024
@@ -106,37 +90,24 @@ final class NativeAudioKeyCapture {
             )
         }
 
-        let decryptorVTable = Self.runtimeDecryptorVTable() ?? 0
-        let decryptorVTableText = decryptorVTable == 0
-            ? "none"
-            : "0x" + String(decryptorVTable, radix: 16)
-        if decryptorVTable == 0 {
-            DownloadLogger.shared.log(
-                "AUDIO-KEY-SCAN provider vtable unavailable — vtable anchor disabled, keeping the +0x1c0 signature"
-            )
-        }
-
         let startedAt = CFAbsoluteTimeGetCurrent()
         var rawKeys = [UInt8](repeating: 0, count: Self.maxKeys * 16)
         var keyCount: UInt32 = 0
         var scannedBytes: UInt64 = 0
         var regionCount: UInt32 = 0
-        var candidateCount: UInt32 = 0
-        var vtableCount: UInt32 = 0
+        var signatureCount: UInt32 = 0
         var playerCount: UInt32 = 0
 
         let status: Int32 = rawKeys.withUnsafeMutableBufferPointer { buffer in
             EeveeScanPlayerAudioKeys(
                 Self.scanByteBudget,
                 Self.scanTimeBudget,
-                decryptorVTable,
                 buffer.baseAddress,
                 UInt32(Self.maxKeys),
                 &keyCount,
                 &scannedBytes,
                 &regionCount,
-                &candidateCount,
-                &vtableCount,
+                &signatureCount,
                 &playerCount
             )
         }
@@ -146,7 +117,7 @@ final class NativeAudioKeyCapture {
 
         guard status == 0 else {
             DownloadLogger.shared.log(
-                "AUDIO-KEY-SCAN failed status=\(status) scanned=\(scannedBytes)B regions=\(regionCount) candidates=\(candidateCount) vtableHits=\(vtableCount) players=\(playerCount) vtable=\(decryptorVTableText) elapsed=\(elapsedText)s"
+                "AUDIO-KEY-SCAN failed status=\(status) scanned=\(scannedBytes)B regions=\(regionCount) signatures=\(signatureCount) players=\(playerCount) elapsed=\(elapsedText)s"
             )
             return latestKeys()
         }
@@ -172,7 +143,7 @@ final class NativeAudioKeyCapture {
 
         let hex = found.map { $0.map { String(format: "%02x", $0) }.joined() }
         DownloadLogger.shared.log(
-            "AUDIO-KEY-SCAN status=ok regions=\(regionCount) scanned=\(scannedBytes)B candidates=\(candidateCount) vtableHits=\(vtableCount) players=\(playerCount) vtable=\(decryptorVTableText) elapsed=\(elapsedText)s keys=\(found.count) total=\(merged.count) values=\(hex)"
+            "AUDIO-KEY-SCAN status=ok regions=\(regionCount) scanned=\(scannedBytes)B signatures=\(signatureCount) players=\(playerCount) elapsed=\(elapsedText)s keys=\(found.count) total=\(merged.count) values=\(hex)"
         )
         return merged
     }
@@ -236,25 +207,6 @@ final class NativeAudioKeyCapture {
             "AUDIO-KEY-RESOLVE ok image=\(imageIndex) slide=0x\(slideHex) addr=0x\(String(runtimeAddress, radix: 16))"
         )
         return pointer
-    }
-
-    /// Runtime address of the decryptor provider vtable, used by the scan as a
-    /// definitive "this is a real decryptor" check. Falls back to nil when the
-    /// Spotify image is not loaded, in which case the scan skips the check.
-    static func runtimeDecryptorVTable() -> UInt64? {
-        guard let slide = spotifyImageSlide() else {
-            return nil
-        }
-        return decryptorProviderVTableFileAddress &+ UInt64(bitPattern: Int64(slide))
-    }
-
-    /// Slide of the loaded Spotify image, independent of which image is dyld's
-    /// image 0 (LiveContainer reports its own executable there).
-    private static func spotifyImageSlide() -> Int? {
-        guard let imageIndex = spotifyImageIndex() else {
-            return nil
-        }
-        return _dyld_get_image_vmaddr_slide(imageIndex)
     }
 
     /// Reads memory without faulting. Unlike `pointer.pointee`, a failed
