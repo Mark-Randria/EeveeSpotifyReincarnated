@@ -205,7 +205,7 @@ struct EeveeDownloadsSettingsView: View {
                     .foregroundColor(Color(UIColor.systemGray2))
                 
                 Text(
-                    "Files are saved as playable audio in the app's Documents folder. For the audio key + CDN URL to be captured, play the track first, then tap Download."
+                    "Files are saved as playable audio in the app's Documents folder. The AES key is read from the track that is actually playing, so start playback of this exact track (audible, not paused) and keep it playing while the download runs. Opening a track page alone is not enough."
                 )
                 .font(.footnote)
                 .foregroundColor(.secondary)

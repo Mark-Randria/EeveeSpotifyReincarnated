@@ -29,10 +29,12 @@ enum {
 
 /// One player-shaped window seen by the scan, for the diagnostic log. `inner`
 /// is the value at `player+0x78`; `inner_key_length` is the low 32 bits at
-/// `inner+0x7c` (the key length the setter copies into `player+0x1c4`), or
-/// `UINT32_MAX` when that read failed. `inner_valid` means that length and the
-/// key-type byte at `inner+0x80` both match the player's copies at `+0x1c4`
-/// and `+0x1c8`, which proves the object is a keyed player.
+/// `inner+0x7c` (the word the setter copies into `player+0x1c4`), or
+/// `UINT32_MAX` when that read failed. Despite the name this is NOT a reliable
+/// key length on 9.1.70: the live player observed on 2026-10-28 held a large
+/// opaque value at both copies. `inner_valid` means that word and the key-type
+/// byte at `inner+0x80` both match the player's copies at `+0x1c4`/`+0x1c8`,
+/// which proves the object is a keyed player regardless of the numeric value.
 typedef struct {
     uint64_t address;
     uint64_t inner;
@@ -56,18 +58,21 @@ typedef struct {
 /// the key state, and `key_state_histogram[i]` counts those windows whose
 /// `*(uint32_t *)(+0x1c0)` equals `i` (0..7). `signature_count` is the subset
 /// with state 6. The per-field counts below are restricted to signature hits,
-/// so a log line shows exactly which strict field is missing:
+/// so a log line shows which identity fields are present:
 ///   [ +0x1c0 ] == 6   -> signature_count
-///   [ +0x1c4 ] == 16  -> key_length_16_count
+///   [ +0x1c4 ] == 16  -> key_length_16_count (informational only; a live
+///                        9.1.70 player can carry a non-16 opaque value)
 ///   [ +0x78  ] != 0   -> inner_nonnull_count
 ///   [ +0x190 ] == 1   -> state_190_1_count
-/// all three            -> strict_count
-/// plus transient caller fields -> caller_count
+/// inner != NULL && state 190 == 1 -> strict_count
+/// plus transient caller fields     -> caller_count
 ///
 /// `relaxed_key_count` counts entropy-passing windows with `+0x1c4 == 16` and
 /// a non-NULL `+0x78` under *any* key state (the second key-install path sets
 /// state 3 as well); `relaxed_valid_count` is the subset whose `inner+0x7c`
-/// length/type word matches the player's `+0x1c4`/`+0x1c8` copies.
+/// word/type matches the player's `+0x1c4`/`+0x1c8` copies. The relaxed shape
+/// is only a fallback for non-state-6 installs; the observed live 9.1.70 player
+/// was state 6 with a non-16 +0x1c4 and is found by the base pair.
 /// `candidate_count` is the number of stored candidates and
 /// `key_count` is the number of keys written to `outKeys`.
 typedef struct {
@@ -96,13 +101,15 @@ typedef struct {
 /// A live player is identified either by the key-install pair written by the
 /// setter — `[+0x580] == 1` (playback is allowed to decrypt) and
 /// `*(uint32_t *)(+0x1c0) == 6` (a key was installed) — or by the
-/// layout-independent shape `[+0x580] == 1 && *(uint32_t *)(+0x1c4) == 16 &&
+/// state-independent shape `[+0x580] == 1 && *(uint32_t *)(+0x1c4) == 16 &&
 /// *(void **)(+0x78) != NULL`, verified by reading the inner key manager's
-/// length/type word at `inner+0x7c` and requiring it to equal the player's
-/// copies at `+0x1c4`/`+0x1c8`. The second form exists because 9.1.70's other
-/// key-install path writes state 3. The finished
-/// key is the 16 bytes at `+0x564`, which is exactly what the playback entry
-/// passes to `setKey`.
+/// word/type at `inner+0x7c`/`inner+0x80` and requiring it to equal the
+/// player's copies at `+0x1c4`/`+0x1c8`. The second form exists because 9.1.70's
+/// other key-install path writes state 3. The `+0x1c4` value is not a reliable
+/// key length on 9.1.70 (the observed live player held a large opaque value),
+/// so it must not be used as a success gate; the inner-copy agreement is the
+/// identity check. The finished key is the 16 bytes at `+0x564`, which is
+/// exactly what the playback entry passes to `setKey`.
 ///
 /// The scan walks readable+writable regions in 2 MiB chunks with a byte budget
 /// and a wall-clock deadline. Keys must look like random 16-byte material

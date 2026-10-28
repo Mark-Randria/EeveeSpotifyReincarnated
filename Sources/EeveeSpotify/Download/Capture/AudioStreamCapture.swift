@@ -430,10 +430,11 @@ final class AudioStreamCapture {
     /// Best-effort current track identifier.
     ///
     /// On 9.1.x the player globals (`statefulPlayer` / `nowPlayingScrollViewController`)
-    /// are never set (see resume.md §4.1), so this falls back to the color-lyrics
-    /// URL capture (`capturedTrackId`) via `resolveCurrentTrackInfo()` — the same
-    /// 9.1.x-safe chain the Downloads pipeline uses. Main-thread-bound objects are
-    /// only touched from main, and this is never called per chunk.
+    /// are never set (see resume.md §4.1), so this uses the same fallback chain
+    /// as the Downloads pipeline via `resolveCurrentTrackInfo()`: the Now Playing
+    /// external content identifier first (the actually-playing item), then the
+    /// color-lyrics URL capture (`capturedTrackId`). Main-thread-bound objects
+    /// are only touched from main, and this is never called per chunk.
     func currentTrackID() -> String? {
         resolveCurrentTrackInfo()?.identifier
     }

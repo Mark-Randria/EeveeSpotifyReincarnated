@@ -162,6 +162,37 @@ final class DownloadManager {
 
             DownloadLogger.shared.log("download attempt: track=\(track.identifier)")
 
+            // The native-key path can only decrypt the track that is actually
+            // playing. Log the Now Playing state (and the id the lyrics hook
+            // captured, which can belong to a merely displayed track) so a
+            // wrong-track request is visible before the key probe runs.
+            let nowPlaying = readNowPlayingInfoSnapshot()
+            let targetRawID = track.identifier
+                .split(separator: ":")
+                .last
+                .map(String.init) ?? track.identifier
+            let externalRaw = nowPlaying.externalIdentifier ?? "nil"
+            let externalTrack = nowPlaying.trackIdentifier ?? "nil"
+            let capturedText = capturedTrackId ?? "nil"
+            let rateText = nowPlaying.playbackRate.map { String(format: "%.2f", $0) } ?? "nil"
+            let stateText: String
+            if let isPlaying = nowPlaying.isPlaying {
+                stateText = isPlaying ? "playing" : "paused"
+            } else {
+                stateText = "unknown"
+            }
+            let externalMatchesTarget = nowPlaying.trackIdentifier == targetRawID
+            DownloadLogger.shared.log(
+                "AUDIO-PLAYBACK target=\(track.identifier) title=\(track.title) artist=\(track.artist) external=\(externalRaw) externalTrack=\(externalTrack) captured=\(capturedText) rate=\(rateText) state=\(stateText) match=\(externalMatchesTarget ? 1 : 0)"
+            )
+            if let externalID = nowPlaying.trackIdentifier,
+               capturedText != "nil",
+               capturedText != externalID {
+                DownloadLogger.shared.log(
+                    "AUDIO-PLAYBACK captured-id was stale (captured=\(capturedText) playing=\(externalID)) — targeting the playing track"
+                )
+            }
+
             // 1) Prefer a passively captured stream (key + url from the app's
             //    own playplay/storage-resolve traffic).
             var stream = resolveStreamInfo(forTrackIdentifier: track.identifier)

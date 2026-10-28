@@ -1,7 +1,7 @@
 # Advancement — In-App Offline Downloader via Spotify Local Files
 
-**Status:** playplay + storage-resolve confirmed live on-device; fourth scan found 763 base-pair matches but 32 low-entropy junk keys before the real player; entropy/scoring filters, zero-byte playplay extraction, native-key-only 320 candidates, and resolver self-observation tagging implemented; rebuild and on-device end-to-end retest pending
-**Date:** 2026-10-26
+**Status:** a live 9.1.70 player was found at `0x13526de00` (`base=1 state=6 valid=1 f593=1 f594=1 pending=0 e0=1`) but its key missed every candidate; `+0x1c4` is not a key length on this build (`len=2251632632`). The download target came from the color-lyrics id while the key belonged to the actually-playing track, so the now-playing external identifier is now preferred, `AUDIO-PLAYBACK` logging is added, and `players`/`active` no longer require `keyLen16`; rebuild and retest with the target audibly playing pending
+**Date:** 2026-10-28
 **Branch:** `feat/download-impl`
 **Target:** Spotify `9.1.70` (`ipa_original/Spotify_9.1.70.ipa`)
 **Accepted UX:** the downloaded song appears under Spotify's **Local Files** and plays offline in the Spotify player. It does **not** replace the original Spotify track row.
@@ -760,15 +760,87 @@ Read the next log as follows:
 - `states=[…]`: if index 6 is large, state-6 look-alikes dominate. If index 3 is large, state-3 players exist and the relaxed path is the one that must catch them.
 - `keyLen16=… inner=… s190=…` (among signature hits): shows which strict field the 523-like population fails.
 - `relaxed=… valid=…`: `relaxed > 0, valid = 0` means player-shaped objects exist but the inner length never matches; `valid > 0` means at least one genuinely keyed player was found and its key is in `values=[…]`.
-- `AUDIO-KEY-PROFILE` rows: `state`, `len`, `innerLen`, `valid`, `base`, and `score` identify the top candidates. A real player should show `len=16`, `innerLen=16`, `valid=1`.
+- `AUDIO-KEY-PROFILE` rows: `state`, `len`, `innerLen`, `valid`, `base`, and `score` identify the top candidates. A real player shows `base=1`, `state=6`, `valid=1` and `len == innerLen`; on 9.1.70 that word is **not** 16 (see §15).
 
 If `valid=0` and `signature_count=523` with `keyLen16=0`, the 523 are confirmed look-alikes and the live player was absent; ensure playback and retry before changing the scan further.
 
 Expected success path:
 
 ```text
-AUDIO-KEY-SCAN status=ok ... signatures=... players=1 ... relaxed=... valid=1 ... keys=...
-AUDIO-KEY-PROFILE 1/… state=6 len=16 innerLen=16 valid=1 ...
+AUDIO-KEY-SCAN status=ok ... signatures=... keyLen16=0 ... players=1 ... active=1 ...
+AUDIO-KEY-PROFILE 1/… state=6 len=<setter word> innerLen=<same word> valid=1 ...
 AUDIO-KEY-PROBE selected container=ogg ...
 AUDIO-PUBLISH ... .m4a
 ```
+
+> Update (2026-10-28 14:06): the next run disproved the `len=16 innerLen=16` expectation. The live player carried `len=innerLen=2251632632` with the copy/type invariant intact, and `players` was 0 only because the counter still required `keyLen16`. See §15.
+
+## 15. Sixth on-device run: live player found, wrong-track identity (2026-10-28 14:06)
+
+### 15.1 What the run showed
+
+- Two downloads (14:07:17 and 14:09:03) targeted `spotify:track:1uJKkC2V6jATojfumZCuAb`. Both scans found the same live player at `0x13526de00`:
+
+  ```text
+  AUDIO-KEY-PROFILE 1/4 addr=0x13526de00 base=1 state=6 len=2251632632 inner=0x136cc8e00 innerLen=2251632632 valid=1 s190=1 f593=1 f594=1 pending=0 e0=1 score=63 key=6399d7e8…c37d
+  ```
+
+  `f593=1 f594=1 pending=0 e0=1` are the exact transient fields of the playback decrypt caller, so this was a player actively decrypting audio at scan time. The same address/key appeared in both attempts, so the same track stayed loaded/playing between them.
+- `AUDIO-KEY-SCAN status=ok ... keyLen16=0 ... players=0 active=0 ... keys=12` (14:07) and `... keys=13` (14:09). All keys missed all four candidates (OGG 320/160/96 and AAC 24); the probe heads were random bytes.
+- `+0x1c4` and `inner+0x7c` were both `2251632632`, not 16. The setter's copy invariant and the key-type byte agreed (`valid=1`), but the field is **not a key length** on this build. `players=0` was therefore a counter bug, not evidence that the player was absent.
+- At 14:06:46 the app requested `fileId=15315b4f79d835af5a5c4055803d71b75a59879b` while the captured now-playing signal said `6ZNw9Cnc85OeHZrjMAZJfY`; `15315b` is the 96 kbps candidate of the download target `1uJK…`. This is consistent with the app prefetching the next track while another track played.
+- The download target came from `capturedTrackId` (the last `/color-lyrics/v2/track/{id}` request), while the key belonged to the track that was actually playing. `resolveCurrentTrackInfo()` mixed that id with MPNowPlayingInfoCenter title/artist, so the UI could show the playing track while the pipeline resolved a different track.
+
+### 15.2 Now-playing identity fix
+
+- `CurrentTrackInfo.swift` now reads `MPNowPlayingInfoPropertyExternalContentIdentifier` and `MPNowPlayingInfoPropertyPlaybackRate`. Spotify 9.1.70 imports both symbols (verified in the shipped binary), so the external identifier is the best "actually playing" signal available when the player globals are nil.
+- The identifier normalizer accepts `spotify:track:<id>`, a bare 22-character base62 id, and `open.spotify.com/track/<id>`; it rejects playlist/album/episode context URIs so a context can never be downloaded as a track.
+- That playing id is preferred over `capturedTrackId`; title/artist come from the same Now Playing snapshot. The lyrics-captured id remains the fallback when the external id is absent or is not a track. The Downloads UI therefore displays a consistent playing item instead of the playing title with a different track id.
+- `DownloadManager.performDownload` logs before resolving candidates:
+
+  ```text
+  AUDIO-PLAYBACK target=<id> title=<t> artist=<a> external=<raw> externalTrack=<normalized> captured=<lyrics id> rate=<0.00|1.00> state=playing|paused|unknown match=0|1
+  AUDIO-PLAYBACK captured-id was stale (captured=<id> playing=<id>) — targeting the playing track
+  ```
+
+  `externalTrack` is the id the pipeline actually used; `captured` is the old lyrics id. If they differ, the run shows the wrong-track condition directly.
+
+### 15.3 Scan counter fix
+
+- `strict_count`/`caller_count` no longer require `+0x1c4 == 16`. Strict is now `inner != NULL && [+0x190] == 1`; caller adds `+0x593`, `+0x594`, `+0x598 != +0x5a0`, and `+0xe0`. `key_length_16_count` and `keyLen16=` remain as information only, expected to be 0 on the live 9.1.70 player.
+- The relaxed path still requires `+0x1c4 == 16` and is only a fallback for non-state-6 installs. The observed live player is state 6 and is emitted by the base pair regardless of its `+0x1c4` value.
+- The host harness adds a `live-non16` fixture with `+0x1c4 = inner+0x7c = 2251632632` and a matching type byte. It verifies the player is counted (`sig=1 len16=0 inner=1 s190=1 strict=1 active=1 keys=1`) and that the public API emits its key (`api-non16: sig=1 len16=0 strict=1 caller=1 candidates=1 keys=1`).
+
+### 15.4 Host verification
+
+All 16 checks pass under ASan/UBSan:
+
+```text
+live: activeFlags=5 hist6=1 sig=1 strict=1 active=1 len16=1 inner=1 s190=1 relaxed=1 valid=1 keys=1
+inactive: activeFlags=4 sig=0 keys=0
+state3: activeFlags=5 hist3=1 sig=0 relaxed=1 valid=1 keys=1
+state3-mismatch: relaxed=1 valid=0 keys=1
+state3-type-mismatch: relaxed=1 valid=0 keys=1
+base-invalid-inner: sig=1 valid=0 keys=1
+zero: sig=1 keys=0
+one-zero: sig=1 keys=1
+duplicate: sig=2 strict=2 active=2 keys=1
+straddle: scanned=2097152 sig=1 strict=1 keys=1 addr=0x100001f00
+wrong-state noise: sig=0 relaxed=0 keys=0
+junk763: sig=764 strict=1 active=1 keys=1
+score-order: first=dead... second=137f...
+api: status=0 scanned=2097152 regions=1 activeFlags=5 sig=1 len16=1 inner=1 s190=1 strict=1 caller=1 relaxed=1 valid=1 candidates=1 keys=1 profiles=1
+live-non16: sig=1 len16=0 inner=1 s190=1 strict=1 active=1 relaxed=0 valid=0 keys=1
+api-non16: sig=1 len16=0 strict=1 caller=1 candidates=1 keys=1
+ALL SCAN TESTS PASSED
+```
+
+### 15.5 Next gate
+
+Rebuild, start audible playback of the exact track being downloaded, keep it playing (not paused), then tap Download. Read the new log in this order:
+
+1. `AUDIO-PLAYBACK ... externalTrack=<target> captured=<same or different> rate=1.00 state=playing match=1`. If `captured` differs from `externalTrack`, the old lyrics-id path was pointing at a different track and the fix is doing its job. If `external` is a context URI (`spotify:playlist:…`), the normalizer rejects it and `captured` is used; the log makes that visible.
+2. `AUDIO-KEY-SCAN ... keyLen16=0 ... players=1 active=1` — the live player is now counted even though `+0x1c4` is not 16. A `AUDIO-KEY-PROFILE` row with `base=1 state=6 valid=1` and `len == innerLen` (any value) is the same live player seen in §15.1.
+3. `AUDIO-KEY-PROBE selected container=ogg` (or the AAC/M4A path) means the key decrypted the stream.
+
+If `externalTrack == target`, `state=playing`, `players=1`, and the top key still misses every candidate, the identity/track explanation is ruled out. The next investigation is then the key material itself: locate Spotify's per-fileId key cache / `decrypt_and_bind_key` output rather than adding more scan heuristics, and verify the AES-CTR geometry against a known plaintext stream. The `+0x564` bytes and the fixed-IV CTR scheme would both need re-validation at that point.

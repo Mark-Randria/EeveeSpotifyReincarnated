@@ -22,7 +22,7 @@ import MachO
 ///       void    *inner;        // +0x78  key-manager/inner object
 ///       ...
 ///       uint32_t keyState;     // +0x1c0 set to 6 by the key setter
-///       uint32_t keyLength;    // +0x1c4 copied from inner+0x7c
+///       uint32_t innerWord;    // +0x1c4 copied from inner+0x7c
 ///       ...
 ///       uint8_t  key[28];      // +0x564 (first 16 bytes are the AES-128 key)
 ///       ...
@@ -38,15 +38,19 @@ import MachO
 ///
 /// `EeveeScanPlayerAudioKeys` walks readable+writable memory once. It matches
 /// the `+0x580 == 1 && +0x1c0 == 6` player pair, and also a state-independent
-/// shape (`+0x1c4 == 16` plus a non-NULL `+0x78`) whose inner key length at
-/// `inner+0x7c` is verified to equal `+0x1c4`. The second form is required
-/// because 9.1.70's other key-install path writes state 3 as well as 6. Keys
-/// that do not look like random 16-byte material are dropped; surviving keys
-/// are ranked by the key setter's `+0x1c4 == 16` / `+0x78 != NULL` fields plus
-/// the playback caller's `+0x190`, `+0x593`, `+0x594`, `+0x598 != +0x5a0`, and
-/// `+0xe0` checks. The download path then checks every key against the
-/// encrypted CDN prefix, so a stale key from another track is discarded
-/// automatically.
+/// shape (`+0x1c4 == 16` plus a non-NULL `+0x78`) whose inner word at
+/// `inner+0x7c` is verified to equal `+0x1c4`. The second form is a fallback
+/// for 9.1.70's other key-install path, which writes state 3 as well as 6.
+///
+/// `+0x1c4` is **not** a reliable key length on 9.1.70: the live player found
+/// on 2026-10-28 had a large opaque value there and at `inner+0x7c` (copy
+/// invariant intact), while every probe still ran. It is therefore never a
+/// hard success gate; the base pair and the caller fields identify the player.
+/// Keys that do not look like random 16-byte material are dropped; surviving
+/// keys are ranked by `+0x78 != NULL`, `+0x190`, the playback caller's
+/// `+0x593`, `+0x594`, `+0x598 != +0x5a0`, `+0xe0`, and the inner-copy
+/// invariant. The download path then checks every key against the encrypted
+/// CDN prefix, so a stale key from another track is discarded automatically.
 ///
 /// Capture is a read-only memory scan; no code page is ever written.
 final class NativeAudioKeyCapture {

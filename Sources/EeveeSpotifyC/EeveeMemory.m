@@ -53,7 +53,7 @@ int32_t EeveeReadMemory(uint64_t address,
 //       void    *inner;        // +0x78  key-manager/inner object
 //       ...
 //       uint32_t keyState;     // +0x1c0 set to 6 by the key setter
-//       uint32_t keyLength;    // +0x1c4 copied from inner+0x7c
+//       uint32_t innerWord;    // +0x1c4 copied from inner+0x7c
 //       ...
 //       uint8_t  key[28];      // +0x564 first 16 bytes are the AES-128 key
 //       ...
@@ -65,6 +65,11 @@ int32_t EeveeReadMemory(uint64_t address,
 // decrypt unless `+0x580 == 1` and passes exactly `player + 0x564` to the
 // decryptor's `setKey`. The pair `+0x580 == 1 && +0x1c0 == 6` is therefore a
 // direct, stable description of a live player that owns the current AES key.
+//
+// +0x1c4 is copied from the inner object's word at inner+0x7c, but on the
+// 9.1.70 live player observed on 2026-10-28 it holds a large opaque value, not
+// 16. It is an identity invariant (the two copies must agree), never a key
+// length gate: a real live player has `players=1` even when keyLen16=0.
 //
 // Why the scan does not anchor on the decryptor vtable: the decrypt entry
 // constructs a mode-0 decryptor on the *stack* for each playback call
@@ -170,10 +175,10 @@ typedef struct {
     uint32_t inner_reads;
     uint32_t active_flag_hits;    // windows with [+0x580] == 1
     uint32_t signature_hits;      // active flag + keyState == 6
-    uint32_t key_length_16_hits;  // signature hits with [+0x1c4] == 16
+    uint32_t key_length_16_hits;  // informational: signature hits with [+0x1c4] == 16
     uint32_t inner_nonnull_hits;  // signature hits with a non-NULL +0x78
     uint32_t state_190_1_hits;    // signature hits with [+0x190] == 1
-    uint32_t strict_hits;         // signature hits with all three fields above
+    uint32_t strict_hits;         // signature hits with inner != NULL && +0x190 == 1
     uint32_t active_hits;         // strict hits + transient caller fields
     uint32_t relaxed_key_hits;    // entropy keys with keyLength 16 + inner
     uint32_t relaxed_valid_hits;  // relaxed hits whose inner length/type word agrees
@@ -285,14 +290,19 @@ static void eevee_sort_candidates_by_score(EeveeKeyCollector *collector) {
 }
 
 /// Hot loop: match either the key-install pair (`+0x580 == 1`,
-/// `+0x1c0 == 6`) or the layout-independent shape (`+0x580 == 1`,
+/// `+0x1c0 == 6`) or the state-independent shape (`+0x580 == 1`,
 /// `+0x1c4 == 16`, non-NULL `+0x78`), score the setter/caller fields, and copy
 /// the finished AES key from `+0x564`.
 ///
+/// +0x1c4 is NOT reliably 16 on 9.1.70 (the observed live player held a large
+/// opaque value), so it is only an informational counter and a relaxed-path
+/// shape check. The base pair plus the inner/caller fields identify the live
+/// player; the strict counters deliberately do not require `key_length == 16`.
+///
 /// `base_address` is the absolute address of `buffer[0]`; it is only used for
 /// the profile log. Every entropy-passing candidate is checked against the
-/// setter invariant `player+0x1c4 == *(u32 *)(inner+0x7c)`, which proves the
-/// object is a keyed player even when `+0x1c0` is not 6.
+/// setter invariant `player+0x1c4 == *(u32 *)(inner+0x7c)` (plus the type
+/// byte), which proves the object is a keyed player even when `+0x1c0` is not 6.
 static void eevee_scan_player_buffer(const uint8_t *buffer,
                                      uint64_t length,
                                      uint64_t base_address,
@@ -343,7 +353,10 @@ static void eevee_scan_player_buffer(const uint8_t *buffer,
             if (inner != 0) collector->inner_nonnull_hits++;
             if (state_190 == 1) collector->state_190_1_hits++;
 
-            int strict = key_length == 16u && inner != 0 && state_190 == 1;
+            // +0x1c4 is not a reliable key-length field on 9.1.70 (the live
+            // player carries an opaque value there). A keyed player is the
+            // inner object plus the playback state, not `key_length == 16`.
+            int strict = inner != 0 && state_190 == 1;
             if (strict) {
                 collector->strict_hits++;
             }
