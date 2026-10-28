@@ -1,6 +1,6 @@
 # Advancement — In-App Offline Downloader via Spotify Local Files
 
-**Status:** playplay + storage-resolve confirmed live on-device; native 9.1.70 AES key capture, multi-key CDN probe, and Ogg Vorbis -> AAC/M4A transcode implemented; rebuild and on-device end-to-end retest pending
+**Status:** playplay + storage-resolve confirmed live on-device; fourth scan found 763 base-pair matches but 32 low-entropy junk keys before the real player; entropy/scoring filters, zero-byte playplay extraction, native-key-only 320 candidates, and resolver self-observation tagging implemented; rebuild and on-device end-to-end retest pending
 **Date:** 2026-10-26
 **Branch:** `feat/download-impl`
 **Target:** Spotify `9.1.70` (`ipa_original/Spotify_9.1.70.ipa`)
@@ -595,3 +595,96 @@ If any condition fails, move to M4.
 | 2026-10-27 | First on-device run of the player scan: no launch crash, `AUDIO-KEY-SCAN status=ok regions=91 scanned=10059776B candidates=2098 keys=16`, but every key was a random heap object (`02000000…`, `trackNumber`, …) and all 16 probes missed. The header checks (`+0x08 == 1`, `+0x0c == +0x00`) are too weak, and stopping at 16 false keys ended the scan after 10 MB. Diagnosed the decryptor constructor `0x104fc6b54`: it writes the fixed vtable of the key-provider object (`0x10bfa5350`, `__DATA_CONST`) to `decryptor + 0x310`. That value is now the decisive match. The scan also passes the image slide in and logs `vtableHits`; the disassembly also confirms `setKey` is `0x101231c1c` (`this+0x78`), so the decryptor is `[player+0x78] + 0x78` as assumed. Cloud rebuild pending. |
 | 2026-10-28 | Second on-device run: no crash, `vtableHits=0`, `candidates=14684`, `scanned=35241984B`, 16 junk keys (`SPTCollectionPla`, reversed strings, pointer pairs), every probe missed. Root cause: the **provider-signature fallback** (`provider+0x14 == 1` plus a plausible `+0x318`) is also weak on this pointer-dense heap and filled all 16 slots at 35 MB, ending the walk before the player was reached. `vtableHits=0` therefore reflects scan coverage, not a bad constant. Rewrote the scan as two syscall-free passes: (1) match the literal vtable word (`host = A - 0x388`, validated by the live decryptor header) or the `[+0x580] == 1 && *(u32*)(+0x1c0) == 6` player pair, (2) match a pointer to an anchor host (`player = B - 0x78`, require `+0x580 == 1`, read `+0x564`). Removed every weak acceptance path, raised the key list to 32, added a `players` diagnostic and one 1 GiB/8 s budget per pass. Cloud rebuild pending. |
 | 2026-10-28 | Third on-device run: `vtableHits=13/14`, `candidates=1/2`, but `players=0` both times. Re-disassembled the key setter `0x100e67d90`, playback caller `0x101ccc338`, key setup `0x103b62cc0`, and decryptor ctor `0x104fc6b54`. Playback constructs a mode-0 decryptor **on the stack** and destroys it per call; the provider vtable hits belong to unrelated/transient decryptors, so deriving the player from them was invalid. The stable player evidence is `+0x1c0 == 6` (key installed), `+0x580 == 1` (playback allowed), and the AES key at `+0x564` (exactly what the caller passes to `setKey`). Replaced the two-pass vtable walk with a single direct player-signature scan; diagnostics are now `signatures` and `players`, the vtable parameter/`vtableHits` were removed, and host tests cover live/inactive/state0/zero-key/duplicate/chunk-straddle/noise cases. Cloud rebuild pending. |
+
+---
+
+## 13. Fourth on-device key-scan run (2026-10-28 12:26)
+
+### 13.1 What the run showed
+
+- Scan: `signatures=763 players=32 keys=32` (second attempt: `signatures=760 players=32 keys=32`).
+- Every collected key was low-entropy integer/pointer junk (for example `00000000000000000000000002000000`, `01000000010000000000000002000000`, `00000000080000000000000000000000`). The real player was not among the first 32 matches.
+- All CDN probes missed, as expected for junk keys.
+- OGG320 `aea0af69bd767b7f90bbc29213303adf5731e9cc` failed with `playplay key response contained no 16-byte key` in both runs; OGG160 `dd5c...`, OGG96 `691a...`, and AAC24 `8054...` resolved.
+- The second run's first candidate was `8054... UNKNOWN`, the previous run's last-resolved file id. This confirmed resolver self-observation: the downloader's own `storage-resolve` requests were being mapped to the current track by the global URLSession hook.
+
+### 13.2 Re-checked disassembly
+
+Key setter `0x100e67d90`:
+
+```text
+str  w8, [x19, #0x1c0]      ; keyState = 6
+ldr  x0, [x19, #0x78]       ; inner key manager
+bl   0x101231c1c            ; inner setKey
+ldr  x8, [x19, #0x78]
+ldur x8, [x8, #0x7c]        ; low 32 bits = key length
+str  w8, [x19, #0x1c4]      ; keyLength (expected 16)
+...
+strb w8, [x19, #0x580]      ; active = 1
+```
+
+The finished key is copied to `+0x564` in both branches; the first-install branch writes the previous state to `+0x550` and the new key to `+0x564`.
+
+Playback caller `0x101ccc338`:
+
+```text
+ldrb w8,  [x0, #0x594]      ; == 1
+ldrb w8,  [x0, #0x593]      ; == 1
+ldr  x8,  [x0, #0x598]
+ldr  x9,  [x0, #0x5a0]
+cmp  x8, x9                 ; require != (pending encrypted bytes)
+ldrb w10, [x0, #0x580]      ; == 1
+ldrb w10, [x0, #0x190]      ; == 1
+ldr  x10, [x0, #0xe0]       ; require != 0
+...
+setKey(player+0x564)
+decrypt(+0x598 .. +0x5a0)
+```
+
+The `+0x593`, `+0x594`, `+0x598`, and `+0x5a0` fields are transient between decrypt calls, so they are ranking evidence, not hard gates. The persistent setter fields (`+0x1c4 == 16`, `+0x78 != NULL`, `+0x190 == 1`) are stricter but still not required for collection.
+
+### 13.3 Scan fix
+
+`EeveeScanPlayerAudioKeys` now:
+
+- hard-rejects all-zero and low-entropy keys: `zero_count <= 4` and `distinct >= 8`;
+- scores surviving keys using `+0x1c4 == 16`, `+0x78 != 0`, `+0x190 == 1`, `+0x593 == 1`, `+0x594 == 1`, `+0x598 != +0x5a0`, and `+0xe0 != 0`;
+- returns the highest-scoring keys first;
+- reports `signatures`, `players` (strict setter fields), `active` (playback-caller fields), and `keys`;
+- keeps 64 keys in `NativeAudioKeyCapture`.
+
+Host tests cover: live player, inactive player, state 0, zero key, a normal key with one zero byte, duplicate keys, a chunk-straddling player, wrong-state noise, 763 low-entropy junk objects plus a real player, and score ordering. Result: `junk763: signatures=764 strict=1 active=1 players=1 keys=1`.
+
+### 13.4 OGG320 playplay fix
+
+`AudioKeyExtractor` previously required all 16 bytes to be non-zero. A random 16-byte obfuscated key contains at least one zero byte about 6% of the time; OGG320 was the only format failing, which matches that probability. Both the canonical field-1 path and the heuristic now accept any non-all-zero 16-byte payload. On failure, `SpotifyAPIResolver` logs `bytes`, top-level protobuf `fields`, and a 24-byte prefix so the 320 response shape can be confirmed.
+
+### 13.5 Native-key-only candidates
+
+The playplay key is not used by the native-key decrypt path. `resolveAudioStreamForNativeKey` now:
+
+1. attempts playplay extraction;
+2. keeps going if it fails;
+3. always resolves the CDN URL;
+4. returns `(key: nil, cdnURL:)` when only the URL is available.
+
+`DownloadManager` turns this into a candidate whose label ends in `OGG_VORBIS_320` (or whichever format), with `key=native-only`. Previously a playplay failure dropped the candidate entirely; if the player was streaming OGG320, the recovered native key had no 320 file to decrypt. This is the most likely end-to-end blocker after the scan fix.
+
+The captured file id is also merged into the metadata list by moving the matching candidate to the front, preserving its format and rank instead of inserting a bare `UNKNOWN` duplicate.
+
+### 13.6 Resolver self-observation fix
+
+`SpotifyAPIResolver` tags every request with `X-Eevee-Download-Resolve: 1`. `AudioStreamCapture` ignores tagged requests and responses in `observeRequestURL`, `observeAudioResponse`, and `observeStorageResolveResponse`, so resolver traffic no longer rewrites `_fileIDsByGID` for the current track. Token/header capture in `observe` is unchanged.
+
+### 13.7 Next gate
+
+Rebuild, play `spotify:track:2jYoHERAJLmbPEzgEq3q81`, and start the download while it is still playing. Expected:
+
+```text
+AUDIO-KEY-SCAN status=ok ... signatures=... players=... active=... keys=1..N
+AUDIO-FORMAT-PROBE resolvable fileId=aea0... format=OGG_VORBIS_320 key=native-only ...
+AUDIO-KEY-PROBE selected container=ogg ...
+AUDIO-PUBLISH ... .m4a
+```
+
+If `keys=0`, the entropy bound is rejecting the real key or the player was not live. If keys are found but every candidate misses, compare the playing file id with the candidate list and check whether the 320 `storage-resolve` URL actually resolved; a sanitized capture of the app's native `storage-resolve` request for `aea0...` would then be the next step.
