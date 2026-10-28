@@ -328,7 +328,13 @@ class URLSessionTaskResumeHook: ClassHook<NSObject> {
             // that may bypass the SPTDataLoaderService / HttpClientURLSession
             // delegates — so it is the reliable place to learn the 40-hex
             // fileId for the current track. Never alters control flow.
-            AudioStreamCapture.shared.observeRequestURL(url)
+            // `currentRequest` is normally populated by `resume`, but fall back
+            // to `originalRequest` so our resolver tag is still seen.
+            AudioStreamCapture.shared.observeRequestURL(
+                url,
+                headers: task.currentRequest?.allHTTPHeaderFields
+                    ?? task.originalRequest?.allHTTPHeaderFields
+            )
 
             let elapsed = Date().timeIntervalSince(tweakInitTime)
             let elapsedInt = Int(elapsed)

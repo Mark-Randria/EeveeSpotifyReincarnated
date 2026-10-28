@@ -168,7 +168,11 @@ class HttpClientURLSessionHook: ClassHook<NSObject>, SpotifySessionDelegate {
         // Audio stream bodies are encrypted and can never contain a key — only
         // key-exchange responses are buffered for extraction.
         if url.isAudioKeyExchangeURL {
-            AudioStreamCapture.shared.observeAudioResponse(url, data: data)
+            AudioStreamCapture.shared.observeAudioResponse(
+                url,
+                data: data,
+                headers: task.currentRequest?.allHTTPHeaderFields
+            )
         }
 
         // storage-resolve responses carry the CDN URL in protobuf field 2
@@ -176,7 +180,11 @@ class HttpClientURLSessionHook: ClassHook<NSObject>, SpotifySessionDelegate {
         // location without depending on the C++ core's own stream request being
         // observable through these delegates.
         if url.isStorageResolveURL {
-            AudioStreamCapture.shared.observeStorageResolveResponse(url, data: data)
+            AudioStreamCapture.shared.observeStorageResolveResponse(
+                url,
+                data: data,
+                headers: task.currentRequest?.allHTTPHeaderFields
+            )
         }
 
         if SpotifyResponsePatcher.shouldBlock(url) { return }

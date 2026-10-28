@@ -41,6 +41,20 @@ import Foundation
 final class AudioStreamCapture {
     static let shared = AudioStreamCapture()
 
+    /// Marks requests issued by our own download resolver. The global
+    /// `NSURLSessionTask.resume` hook sees every URLSession task, including the
+    /// resolver's playplay/storage-resolve calls; without this tag, each
+    /// resolver request rewrites `_fileIDsByGID[currentTrack]` and the next
+    /// download starts from the previous run's last-resolved file id.
+    static let resolverRequestHeader = "X-Eevee-Download-Resolve"
+
+    static func isResolverRequest(headers: [String: String]?) -> Bool {
+        guard let headers else { return false }
+        return headers.contains {
+            $0.key.caseInsensitiveCompare(resolverRequestHeader) == .orderedSame
+        }
+    }
+
     struct AudioStream {
         let trackGID: String
         let key: Data
@@ -167,7 +181,12 @@ final class AudioStreamCapture {
     /// On 9.1.70 this is the `POST /playplay/v1/key/{fileId}` response. The
     /// request URL carries a 40-hex fileId (NOT a track GID), so the track is
     /// resolved from the currently-playing track instead of the URL.
-    func observeAudioResponse(_ url: URL, data: Data) {
+    func observeAudioResponse(
+        _ url: URL,
+        data: Data,
+        headers: [String: String]? = nil
+    ) {
+        guard !Self.isResolverRequest(headers: headers) else { return }
         guard url.isAudioKeyExchangeURL else { return }
 
         lock.lock()
@@ -229,7 +248,12 @@ final class AudioStreamCapture {
     /// protobuf response carries the CDN URL(s) in field 2 (`cdnurl`). Parsing
     /// this gives us the exact URL the app itself would stream from, without
     /// depending on the C++ core's CDN request being observable.
-    func observeStorageResolveResponse(_ url: URL, data: Data) {
+    func observeStorageResolveResponse(
+        _ url: URL,
+        data: Data,
+        headers: [String: String]? = nil
+    ) {
+        guard !Self.isResolverRequest(headers: headers) else { return }
         guard url.isStorageResolveURL else { return }
 
         lock.lock()
@@ -286,7 +310,8 @@ final class AudioStreamCapture {
     /// we DO learn the 40-hex fileId the core is resolving — which is enough for
     /// the download pipeline to re-request playplay + storage-resolve itself
     /// with the captured bearer token.
-    func observeRequestURL(_ url: URL) {
+    func observeRequestURL(_ url: URL, headers: [String: String]? = nil) {
+        guard !Self.isResolverRequest(headers: headers) else { return }
         guard url.isAudioKeyExchangeURL || url.isStorageResolveURL else { return }
 
         // Learn the spclient base (scheme://host) once per distinct host so the
