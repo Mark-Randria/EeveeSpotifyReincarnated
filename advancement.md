@@ -729,13 +729,14 @@ Every entropy-passing candidate performs one `mach_vm_read_overwrite` of `inner+
 
 ### 14.4 Host verification
 
-The host harness (`/tmp/opencode/scan_test/main.c`) was rewritten for the new API and 13 tests pass under ASan/UBSan:
+The host harness (`/tmp/opencode/scan_test/main.c`) was rewritten for the new API and 14 tests pass under ASan/UBSan:
 
 ```text
 live: activeFlags=3 hist6=1 sig=1 strict=1 active=1 len16=1 inner=1 s190=1 relaxed=1 valid=1 keys=1
 inactive: activeFlags=2 sig=0 keys=0
 state3: activeFlags=3 hist3=1 sig=0 relaxed=1 valid=1 keys=1
 state3-mismatch: relaxed=1 valid=0 keys=1
+state3-type-mismatch: relaxed=1 valid=0 keys=1
 base-invalid-inner: sig=1 valid=0 keys=1
 zero: sig=1 keys=0
 one-zero: sig=1 keys=1
@@ -748,7 +749,7 @@ api: status=0 scanned=2097152 regions=1 activeFlags=3 ... candidates=1 keys=1 pr
 ALL SCAN TESTS PASSED
 ```
 
-The API-path test covers the region walk, report filling, profile extraction, validity filtering, score ordering, and key emission.
+The live/state-3 fixtures write a nonzero key type at both `inner+0x80` and `player+0x1c8`; the type-mismatch test changes only the inner byte and verifies the relaxed candidate is not emitted. The API-path test covers the region walk, report filling, profile extraction, validity filtering, score ordering, and key emission.
 
 ### 14.5 Next gate
 
